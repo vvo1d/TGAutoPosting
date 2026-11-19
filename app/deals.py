@@ -84,12 +84,12 @@ def _e(t: str) -> str:
     return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _discount(price: str | None, old: str | None) -> str:
-    def num(s):
-        d = re.sub(r"[^\d]", "", s or "")
+def _discount_pct(price: str | None, old: str | None) -> int:
+    def num(x):
+        d = re.sub(r"[^\d]", "", x or "")
         return int(d) if d else 0
     p, o = num(price), num(old)
-    return f" (−{round((1 - p / o) * 100)}%)" if p and o > p else ""
+    return round((1 - p / o) * 100) if p and o > p else 0
 
 
 def format_deal(post: DealPost, links: list[ProductLink], profile: ChannelProfile,
@@ -98,18 +98,19 @@ def format_deal(post: DealPost, links: list[ProductLink], profile: ChannelProfil
     own_links: {ключ товара: ссылка} — ваши готовые ссылки (например, реферальные с Маркета), ставятся как есть."""
     own_links = own_links or {}
     warnings: list[str] = []
-    parts = [f"<b>{_e(post.title.strip())}</b> {_e(post.emoji.strip())}".strip()]
+    # Заголовок: эмодзи впереди, затем пустая строка и интро
+    parts = [f"{_e(post.emoji.strip())} <b>{_e(post.title.strip())}</b>".strip()]
     if post.intro.strip():
-        parts[0] += "\n" + _e(post.intro.strip())
+        parts.append(_e(post.intro.strip()))
 
-    blocks = []
     for item in post.items[:5]:
         link = _pick_link(item.link, links)
-        line = f"🔥 {_e(item.name.strip())}"
+        lines = [f"🛍 <b>{_e(item.name.strip())}</b>"]
         if item.price:
-            line += f" — <b>{_e(item.price)}</b>"
-            if item.old_price:
-                line += f" <s>{_e(item.old_price)}</s>{_discount(item.price, item.old_price)}"
+            price = f"💰 <b>{_e(item.price)}</b>"
+            if item.old_price and (pct := _discount_pct(item.price, item.old_price)):
+                price += f" вместо <s>{_e(item.old_price)}</s> · −{pct}%"
+            lines.append(price)
         if link:
             url = own_links.get(link.key or "") or affiliate_url(link, profile.affiliate)
             if not url:
@@ -118,14 +119,12 @@ def format_deal(post: DealPost, links: list[ProductLink], profile: ChannelProfil
                     warnings.append(f"{CRITICAL}ссылку {link.name} не удалось раскрыть — замените вручную: {link.url}")
                 else:
                     warnings.append(f"партнёрская ссылка для {link.name} не настроена — стоит чистая ссылка")
-            line += f'\n🛒 <a href="{_e(url)}">Смотреть на {link.name}</a>'
+            lines.append(f'👉 <a href="{_e(url)}">Купить на {link.name}</a>')
         else:
             warnings.append(f"{CRITICAL}у товара «{item.name}» нет ссылки")
-        blocks.append(line)
-    if blocks:
-        parts.append("\n\n".join(blocks))
+        parts.append("\n".join(lines))
     if post.promo_code:
-        parts.append(f"🎟 Промокод: <code>{_e(post.promo_code)}</code>")
+        parts.append(f"🎟 Промокод: <code>{_e(post.promo_code)}</code> (нажмите, чтобы скопировать)")
     tail = []
     if post.rubric:
         tag = re.sub(r"[^\w]", "", post.rubric.lower().replace(" ", "_"))

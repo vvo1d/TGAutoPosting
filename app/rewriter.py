@@ -303,9 +303,10 @@ def format_caption(post: RecipePost) -> str:
 
 def _card_html(post: RecipePost, intro: str, ingredients: list[str], steps: list[str]) -> str:
     e = html_escape
-    parts = [f"<b>{e(post.title.strip())}</b> {e(post.emoji.strip())}".strip()]
+    # Заголовок: эмодзи впереди, затем пустая строка и интро
+    parts = [f"{e(post.emoji.strip())} <b>{e(post.title.strip())}</b>".strip()]
     if intro:
-        parts[0] += "\n" + e(intro)
+        parts.append(e(intro))
     meta = []
     if post.time:
         meta.append(f"⏱ {e(post.time)}")
@@ -317,10 +318,10 @@ def _card_html(post: RecipePost, intro: str, ingredients: list[str], steps: list
         parts.append(" · ".join(meta))
     if ingredients:
         items = "\n".join(f"• {e(i.strip().lstrip('-•–— ').strip())}" for i in ingredients)
-        parts.append(f"<b>Ингредиенты:</b>\n{items}")
+        parts.append(f"🛒 <b>Ингредиенты:</b>\n{items}")
     if steps:
         body = "\n".join(f"{n}. {e(st)}" for n, st in enumerate(steps, 1))
-        parts.append(f"<blockquote expandable><b>Как готовить</b> 👇\n{body}</blockquote>")
+        parts.append(f"<blockquote expandable>👩‍🍳 <b>Как готовить</b>\n{body}</blockquote>")
     if post.rubric:
         tag = re.sub(r"[^\w]", "", post.rubric.lower().replace(" ", "_"))
         if tag:
