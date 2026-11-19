@@ -10,6 +10,7 @@ import re
 import random
 import logging
 import shutil
+import time
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -50,6 +51,7 @@ class Pipeline:
         self.channel_scheduler = ChannelScheduler(tg.client) if tg else None
         self._limit_notified: dict[str, bool] = {}
         self._quota_notified: set[str] = set()
+        self._manual_adding = 0
         self._budget, self._quota_left, self._video_mb = 0, 0, 0
 
     def moderation_chat(self, p: ChannelProfile) -> int:
@@ -309,15 +311,21 @@ class Pipeline:
         root = self.settings.media_dir
         if not root.exists():
             return 0, 0
+        # Сбор качает файлы ДО записи поста в базу: пока он идёт, «ничьи» папки — это скачиваемое сейчас
+        if any(lock.locked() for lock in self._collect_locks.values()) or self._manual_adding:
+            log.info("Уборка медиа отложена: идёт сбор")
+            return 0, 0
         cur = await self.db.conn.execute(
             "SELECT media FROM items WHERE status IN ('new','draft','pending','approved')")
-        keep = {str(Path(m["path"]).parent) for (raw,) in await cur.fetchall() for m in json.loads(raw or "[]")}
+        keep = {str(Path(m["path"]).resolve().parent)
+                for (raw,) in await cur.fetchall() for m in json.loads(raw or "[]")}
+        fresh = time.time() - 2 * 3600  # и на всякий случай не трогаем папки моложе 2 часов
         dirs = removed = 0
         for ch_dir in root.iterdir():
             if not ch_dir.is_dir():
                 continue
             for d in ch_dir.iterdir():
-                if d.is_dir() and str(d) not in keep:
+                if d.is_dir() and str(d.resolve()) not in keep and d.stat().st_mtime < fresh:
                     removed += sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
                     shutil.rmtree(d, ignore_errors=True)
                     dirs += 1
@@ -418,7 +426,13 @@ class Pipeline:
             "SELECT COUNT(*) FROM items WHERE channel=? AND status='scheduled' AND scheduled_at>?", (key, now))
         return (await cur.fetchone())[0]
 
+    @staticmethod
+    def media_ok(item: dict) -> bool:
+        return bool(item["media"]) and all(Path(m.path).exists() for m in item["media"])
+
     async def _rewrite_item(self, p: ChannelProfile, item: dict, note: str | None = None) -> bool:
+        if not self.media_ok(item):
+            return await self._reject(item, "медиа не найдены на диске")
         # Явная реклама — не тратим запрос к модели (только для рецептов: в находках «скидка» и erid — норма)
         if p.content_type == "recipe" and AD_MARKERS.search(item["raw_text"]):
             return await self._reject(item, "похоже на рекламу")
@@ -483,6 +497,13 @@ class Pipeline:
 
     async def add_manual(self, p: ChannelProfile, urls: list[str]) -> dict[str, list[str]]:
         """Товары по ссылкам от модератора (сейчас — Яндекс Маркет). Возвращает отчёт по группам."""
+        self._manual_adding += 1
+        try:
+            return await self._add_manual(p, urls)
+        finally:
+            self._manual_adding -= 1
+
+    async def _add_manual(self, p: ChannelProfile, urls: list[str]) -> dict[str, list[str]]:
         report: dict[str, list[str]] = {"added": [], "dup": [], "skip": [], "error": []}
         since_pool = await self.db.dedup_pool(p.key, -1, p.dedup_days)
         known = {k for o in since_pool if (o["title_key"] or "").startswith("deal:") for k in o["title_key"][5:].split("|")}
@@ -609,6 +630,10 @@ class Pipeline:
         await self.publish(p, items[0])
 
     async def publish(self, p: ChannelProfile, item: dict) -> None:
+        if not self.media_ok(item):
+            await self.db.update(item["id"], status="failed", note="медиа не найдены на диске")
+            await self._notify(p, f"⚠️ #{item['id']}: файлы поста не найдены на диске, опубликовать не могу.")
+            return
         try:
             if visible_len(item["caption"] or "") <= CAPTION_LIMIT:
                 await send_post(self.bot, p.target, item["media"], item["caption"])
@@ -670,6 +695,10 @@ class Pipeline:
         # 2) одобренные -> в отложенные, пока не упрёмся в лимит
         count = len(existing)
         for it in await self.db.by_status(p.key, "approved", limit=1000, order="approved_at, id"):
+            if not self.media_ok(it):  # файлы пропали — пропускаем тихо, на это место встанет следующий
+                log.warning("[%s] #%s: медиа не найдены на диске — пропускаю", p.key, it["id"])
+                await self.db.update(it["id"], status="rejected", note="медиа не найдены на диске")
+                continue
             need = min(len(it["media"]), 10) or 1
             if count + need > p.max_scheduled:
                 self._limit_reached(p, count)
