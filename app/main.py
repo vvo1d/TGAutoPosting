@@ -17,6 +17,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.combining import OrTrigger
 from apscheduler.triggers.cron import CronTrigger
 
+from app import watchdog
 from app.bot.handlers import router
 from app.config import Settings, load_profiles
 from app.db import DB
@@ -94,9 +95,11 @@ async def main() -> None:
         BotCommand(command="restart", description="Перезапустить приложение"),
     ])
 
+    watchdog_task = asyncio.create_task(watchdog.run())  # systemd перезапустит, если цикл событий зависнет
     try:
         await dp.start_polling(bot)
     finally:
+        watchdog_task.cancel()
         scheduler.shutdown(wait=False)
         if tg:
             await tg.stop()

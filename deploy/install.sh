@@ -116,6 +116,9 @@ WorkingDirectory=$APP_DIR
 ExecStart=$APP_DIR/.venv/bin/python -m app.main
 Restart=always
 RestartSec=5
+# Сторож: приложение шлёт «живо» каждые 30 с; если зависнет на 3 минуты — systemd перезапустит
+WatchdogSec=180
+NotifyAccess=main
 Environment=PYTHONUNBUFFERED=1
 Environment=PIP_NO_CACHE_DIR=1
 

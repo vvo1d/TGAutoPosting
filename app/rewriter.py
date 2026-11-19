@@ -277,11 +277,15 @@ def format_caption(post: RecipePost) -> str:
     """Карточка рецепта в HTML. Укладываем в лимит подписи: сокращаем шаги, потом убираем лишнее."""
     steps = [st.strip() for st in post.steps if st.strip()]
     intro, ingredients = post.intro.strip(), list(post.ingredients)
-    while True:
+    shortened = False
+    # Каждая итерация обязательно что-то убирает, поэтому цикл конечен (раньше здесь было вечное зацикливание
+    # на шаге 91–140 символов, который «сокращение» не меняло).
+    for _ in range(len(steps) + len(ingredients) + 10):
         html = _card_html(post, intro, ingredients, steps)
         if visible_len(html) <= CAPTION_LIMIT:
             return html
-        if any(len(st) > 90 for st in steps):  # сначала — шаги до первого предложения
+        if not shortened and any(len(st) > 90 for st in steps):  # один раз: шаги до первого предложения
+            shortened = True
             steps = [re.split(r"(?<=[.!?])\s", st, maxsplit=1)[0] for st in steps]
             steps = [st if len(st) <= 140 else st[:137].rsplit(" ", 1)[0] + "…" for st in steps]
         elif len(steps) > 3:
@@ -293,7 +297,8 @@ def format_caption(post: RecipePost) -> str:
         elif len(ingredients) > 3:
             ingredients = ingredients[:-1]
         else:
-            return html
+            break
+    return _card_html(post, intro, ingredients, steps)
 
 
 def _card_html(post: RecipePost, intro: str, ingredients: list[str], steps: list[str]) -> str:
