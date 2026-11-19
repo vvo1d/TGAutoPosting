@@ -1,0 +1,559 @@
+"""Конвейер: сбор -> переписывание -> модерация -> очередь -> публикация."""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import html
+import re
+import random
+import logging
+import shutil
+from datetime import datetime, time as dtime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from telethon.errors import ScheduleTooMuchError
+
+from app import deals, dedup
+from app.links import LinkResolver, canonical, wb_articles
+from app.config import ChannelProfile, Settings
+from app.db import DB
+from app.models import RawPost
+from app.publisher import send_post
+from app.rules import AD_MARKERS
+from app.scheduler_tg import ChannelScheduler
+from app.rewriter import CAPTION_LIMIT, Rewriter, format_caption, html_escape, visible_len
+from app.sources.telegram import TelegramReader
+from app.sources.market import MarketReader
+from app.sources.web import WebReader
+
+log = logging.getLogger(__name__)
+
+
+class Pipeline:
+    def __init__(self, settings: Settings, profiles: dict[str, ChannelProfile], db: DB, bot: Bot,
+                 tg: TelegramReader | None, web: WebReader, rewriter: Rewriter):
+        self.settings, self.profiles, self.db, self.bot = settings, profiles, db, bot
+        self.tg, self.web, self.rewriter = tg, web, rewriter
+        self.links = LinkResolver()
+        self.market = MarketReader()
+        # Сбор и обработка идут независимо: черновики появляются, пока сбор ещё качает видео
+        self._collect_locks = {k: asyncio.Lock() for k in profiles}
+        self._process_locks = {k: asyncio.Lock() for k in profiles}
+        self._sync_locks = {k: asyncio.Lock() for k in profiles}
+        self.channel_scheduler = ChannelScheduler(tg.client) if tg else None
+        self._limit_notified: dict[str, bool] = {}
+
+    def moderation_chat(self, p: ChannelProfile) -> int:
+        chat = p.moderation_chat or (self.settings.admin_ids[0] if self.settings.admin_ids else None)
+        if not chat:
+            raise RuntimeError("Не задан moderation_chat в профиле и ADMIN_IDS в .env")
+        return chat
+
+    def _media_dir(self, p: ChannelProfile, post: RawPost) -> Path:
+        key = hashlib.sha1(f"{post.source}|{post.source_ref}".encode()).hexdigest()[:16]
+        return self.settings.media_dir / p.key / key
+
+    # ---------- 1. сбор ----------
+
+    async def tick(self, key: str) -> None:
+        """Ручной запуск (/collect): собрать новое и сразу подготовить черновики."""
+        await self.collect_job(key)
+        await self.process_job(key)
+
+    async def collect_job(self, key: str) -> None:
+        if self._collect_locks[key].locked():
+            log.info("[%s] сбор уже идёт", key)
+            return
+        async with self._collect_locks[key]:
+            try:
+                await self.collect(self.profiles[key])
+            except Exception:
+                log.exception("[%s] сбор упал", key)
+
+    async def process_job(self, key: str) -> None:
+        if self._process_locks[key].locked():
+            return
+        async with self._process_locks[key]:
+            try:
+                await self.process(self.profiles[key])
+            except Exception:
+                log.exception("[%s] обработка упала", key)
+
+    async def collect(self, p: ChannelProfile) -> int:
+        added = 0
+        # Обходим источники в случайном порядке, чтобы ни один не был всегда первым
+        tg_sources = random.sample(p.sources.telegram, len(p.sources.telegram))
+        web_sources = random.sample(p.sources.web, len(p.sources.web))
+        if self.tg:
+            for src in tg_sources:
+                try:
+                    added += await self._collect_tg(p, src)
+                except Exception as e:
+                    log.warning("[%s] источник %s: %s", p.key, src.label, e)
+        for src in web_sources:
+            try:
+                added += await self._collect_web(p, src)
+            except Exception as e:
+                log.warning("[%s] сайт %s: %s", p.key, src.rss or src.pages or src.urls, e)
+        if added:
+            log.info("[%s] новых материалов: %d", p.key, added)
+        return added
+
+    async def _collect_tg(self, p: ChannelProfile, src) -> int:
+        source = f"tg:{src.key}"
+        last_id = await self.db.get_last_id(p.key, source)
+        candidates, new_last = await self.tg.fetch(src, last_id)
+        added = 0
+        for c in candidates:
+            tph = next((l for l in c.links if "telegra.ph/" in l), None)
+            if tph and (extra := await self.web.fetch_telegraph(tph)):
+                c.post.text = f"{c.post.text}\n\n{extra}"
+            if await self.db.is_known(p.key, c.post):
+                continue
+            c.post.media = await self.tg.download(c, self._media_dir(p, c.post), p.max_video_mb)
+            if not c.post.media:
+                continue
+            if item_id := await self.db.add_item(p.key, c.post):
+                await self.db.update(item_id, phash=dedup.media_hash(c.post.media))
+                added += 1
+        if new_last is not None:
+            await self.db.set_last_id(p.key, source, new_last)
+        return added
+
+    async def _collect_web(self, p: ChannelProfile, src) -> int:
+        added = 0
+        for url in await self.web.list_urls(src):
+            cur = await self.db.conn.execute("SELECT 1 FROM items WHERE channel=? AND source_ref=?", (p.key, url))
+            if await cur.fetchone():
+                continue
+            res = await self.web.fetch_recipe(url)
+            if not res:
+                continue
+            post, images = res
+            if await self.db.is_known(p.key, post):
+                continue
+            post.media = await self.web.download_images(images, self._media_dir(p, post))
+            if post.media and (item_id := await self.db.add_item(p.key, post)):
+                await self.db.update(item_id, phash=dedup.media_hash(post.media))
+                added += 1
+        return added
+
+    # ---------- 2. переписывание и отправка на модерацию ----------
+
+    async def process(self, p: ChannelProfile) -> None:
+        counts = await self.db.count(p.key)
+        free = p.max_pending_drafts - counts.get("pending", 0)
+        if free <= 0:
+            return
+        new_items = await self.db.by_status(p.key, "new", limit=1000)
+        for it in new_items:  # досчитываем хэши картинок (для материалов, собранных до появления проверки)
+            if not it.get("phash") and (h := dedup.media_hash(it["media"])):
+                it["phash"] = h
+                await self.db.update(it["id"], phash=h)
+        items = self._mix_sources(new_items)[:free]
+        for item in items:
+            try:
+                ok = await self._rewrite_item(p, item)
+                if ok:
+                    await self.send_draft(p, await self.db.get(item["id"]))
+            except Exception as e:
+                # Лимит (429), сбой сервера (5xx), нет оплаты (402), модель снята (410), неверный ключ (401):
+                # материал не виноват — оставляем его в очереди и сообщаем модератору
+                status = getattr(e, "status_code", None)
+                if status in (401, 402, 404, 410, 429) or (status and status >= 500):
+                    log.warning("[%s] LLM недоступна (%s), продолжу позже: %s", p.key, status, str(e)[:200])
+                    if status in (401, 402, 404, 410):
+                        await self._notify(p, f"⚠️ Модель недоступна ({status}): {str(e)[:300]}")
+                    return
+                log.exception("[%s] item %s: ошибка обработки", p.key, item["id"])
+                await self.db.update(item["id"], status="failed", note=str(e)[:500])
+
+    @staticmethod
+    def _mix_sources(items: list[dict]) -> list[dict]:
+        """Перемешиваем источники: случайный порядок, по одному посту от каждого по кругу.
+        Внутри источника первым идёт более популярный пост."""
+        groups: dict[str, list[dict]] = {}
+        for it in items:
+            groups.setdefault(it["source"], []).append(it)
+        queues = [sorted(g, key=lambda it: -(it["views"] or 0)) for g in groups.values()]
+        random.shuffle(queues)
+        # Товары, которые модератор прислал сам, — первыми
+        queues.sort(key=lambda q: not q[0]["source"].startswith("manual:"))
+        mixed: list[dict] = []
+        while queues:
+            for q in list(queues):
+                mixed.append(q.pop(0))
+                if not q:
+                    queues.remove(q)
+        return mixed
+
+    async def _reject(self, item: dict, note: str) -> bool:
+        log.info("[%s] item %s отклонён: %s", item["channel"], item["id"], note)
+        await self.db.update(item["id"], status="rejected", note=note)
+        self._cleanup(item)
+        return False
+
+    async def _rewrite_item(self, p: ChannelProfile, item: dict, note: str | None = None) -> bool:
+        # Явная реклама — не тратим запрос к модели (только для рецептов: в находках «скидка» и erid — норма)
+        if p.content_type == "recipe" and AD_MARKERS.search(item["raw_text"]):
+            return await self._reject(item, "похоже на рекламу")
+
+        # Дубль по картинке/видео — проверяем до модели, это бесплатно
+        pool = await self.db.dedup_pool(p.key, item["id"], p.dedup_days)
+        phash = item.get("phash") or dedup.media_hash(item["media"])
+        if phash:
+            await self.db.update(item["id"], phash=phash)
+            twin = next((o for o in pool if o["phash"] and dedup.hamming(phash, o["phash"]) <= dedup.PHASH_MAX_DISTANCE), None)
+            if twin:
+                return await self._reject(item, f"дубликат по картинке: #{twin['id']}")
+
+        if p.content_type == "deal":
+            return await self._rewrite_deal(p, item, pool, note)
+
+        res = await self.rewriter.rewrite(p, item["raw_text"], item["media"], note=note)
+        if not res.is_recipe:
+            return await self._reject(item, res.reject_reason or "не рецепт")
+
+        # Дубль по рецепту: похожее название + похожие ингредиенты
+        tkey, ikey = dedup.title_key(res.title), dedup.ingredients_key(res.ingredients)
+        await self.db.update(item["id"], title_key=tkey, ingr_key=ikey)
+        twin = next((o for o in pool if o["title_key"] is not None
+                     and dedup.same_recipe(tkey, ikey, o["title_key"], o["ingr_key"] or "")), None)
+        if twin:
+            return await self._reject(item, f"дубликат рецепта: #{twin['id']}")
+
+        caption = format_caption(res)  # сам укладывает карточку в лимит подписи
+        await self.db.update(item["id"], status="draft", caption=caption)
+        return True
+
+    async def _deal_links(self, item: dict) -> list:
+        return await self.links.resolve_all(item["links"] + wb_articles(item["raw_text"]))
+
+    async def _rewrite_deal(self, p: ChannelProfile, item: dict, pool: list[dict], note: str | None) -> bool:
+        links = await self._deal_links(item)
+        if not links:
+            return await self._reject(item, "нет ссылок на товары WB / Ozon / AliExpress / Яндекс Маркета")
+        # Дубль по товару: тот же id на той же площадке
+        keys = {l.key for l in links if l.key}
+        if keys:
+            twin = next((o for o in pool if (o["title_key"] or "").startswith("deal:")
+                         and keys & set(o["title_key"][5:].split("|"))), None)
+            if twin:
+                return await self._reject(item, f"дубликат товара: #{twin['id']}")
+            await self.db.update(item["id"], title_key="deal:" + "|".join(sorted(keys)))
+
+        res = await self.rewriter.rewrite_deal(p, item["raw_text"], item["media"], links, note)
+        if not res.is_deal:
+            return await self._reject(item, res.reject_reason or "не находка")
+        caption, warnings = deals.format_deal(res, links, p, self._own_links(item, links))
+        await self.db.update(item["id"], status="draft", caption=caption, note="\n".join(warnings) or None)
+        return True
+
+    @staticmethod
+    def _own_links(item: dict, links: list) -> dict[str, str]:
+        """Для товаров, присланных модератором, в посте остаётся его ссылка (реферальная)."""
+        if not item["source"].startswith("manual:"):
+            return {}
+        return {l.key: l.source_url for l in links if l.key and l.source_url in item["links"]}
+
+    async def add_manual(self, p: ChannelProfile, urls: list[str]) -> dict[str, list[str]]:
+        """Товары по ссылкам от модератора (сейчас — Яндекс Маркет). Возвращает отчёт по группам."""
+        report: dict[str, list[str]] = {"added": [], "dup": [], "skip": [], "error": []}
+        since_pool = await self.db.dedup_pool(p.key, -1, p.dedup_days)
+        known = {k for o in since_pool if (o["title_key"] or "").startswith("deal:") for k in o["title_key"][5:].split("|")}
+        # Ссылка на ваш список Маркета раскрывается в ссылки на все его товары (с вашими метками)
+        expanded: list[str] = []
+        report["lists"] = []
+        for url in dict.fromkeys(urls):
+            try:
+                items = await self.market.wishlist_items(url)
+            except Exception as e:
+                log.warning("Маркет: список %s: %s", url, e)
+                items = None
+            if items is None:
+                expanded.append(url)
+            else:
+                report["lists"].append(f"{len(items)}")
+                expanded += items
+        for url in dict.fromkeys(expanded):
+            link = await self.links.resolve(url)
+            if not link or link.marketplace != "ym" or not link.key:
+                report["skip"].append(url)
+                continue
+            if link.key in known:
+                report["dup"].append(url)
+                continue
+            try:
+                prod = await self.market.product(url)
+            except Exception as e:
+                log.warning("Маркет %s: %s", url, e)
+                prod = None
+            if not prod:
+                report["error"].append(url)
+                continue
+            post = RawPost(source="manual:ym", source_ref=link.key, text=prod.as_text(), url=prod.url, links=[url])
+            post.media = await self.market.download_images(prod.images, self._media_dir(p, post))
+            if not post.media:
+                report["error"].append(url)
+                continue
+            if item_id := await self.db.add_item(p.key, post):
+                await self.db.update(item_id, phash=dedup.media_hash(post.media), title_key=f"deal:{link.key}")
+                known.add(link.key)
+                report["added"].append(prod.name)
+            else:
+                report["dup"].append(url)
+            await asyncio.sleep(1.5)  # бережно к Маркету
+        return report
+
+    async def send_draft(self, p: ChannelProfile, item: dict) -> None:
+        chat = self.moderation_chat(p)
+        media_msgs = await send_post(self.bot, chat, item["media"], caption=None)
+        ctrl = await self.bot.send_message(
+            chat, _control_text(p, item), reply_markup=moderation_kb(item["id"], p.content_type == "deal"),
+        )
+        await self.db.update(item["id"], status="pending",
+                             draft_msg_ids=[m.message_id for m in media_msgs] + [ctrl.message_id])
+
+    async def regenerate(self, item_id: int, note: str | None = None) -> dict:
+        item = await self.db.get(item_id)
+        p = self.profiles[item["channel"]]
+        note = note or "Напиши другой вариант заголовка и подачи."
+        if p.content_type == "deal":
+            links = await self._deal_links(item)
+            res = await self.rewriter.rewrite_deal(p, item["raw_text"], item["media"], links, note)
+            if res.is_deal:
+                caption, warnings = deals.format_deal(res, links, p, self._own_links(item, links))
+                await self.db.update(item_id, caption=caption, note="\n".join(warnings) or None)
+            return await self.db.get(item_id)
+        res = await self.rewriter.rewrite(p, item["raw_text"], item["media"], note=note)
+        caption = format_caption(res) if res.is_recipe else item["caption"]
+        await self.db.update(item_id, caption=caption)
+        return await self.db.get(item_id)
+
+    async def replace_links(self, item_id: int, pasted: list[str]) -> tuple[dict, list[str]]:
+        """Подставить в пост ссылки модератора (например, партнёрские из приложения маркетплейса).
+        Ссылка встаёт на место ссылки на тот же товар; если товар в посте один — на его место."""
+        item = await self.db.get(item_id)
+        caption = item["caption"] or ""
+        anchors = re.findall(r'<a href="([^"]+)">', caption)
+        report: list[str] = []
+        if not anchors:
+            return item, ["в посте нет ссылок, которые можно заменить"]
+        anchor_links = [canonical(html.unescape(a)) for a in anchors]
+        replaced: set[int] = set()
+        for url in pasted:
+            new = await self.links.resolve(url)
+            idx = None
+            if new and new.key:
+                idx = next((i for i, a in enumerate(anchor_links) if a and a.key == new.key and i not in replaced), None)
+                if idx is None and len(anchors) == 1:
+                    old_key = anchor_links[0].key if anchor_links[0] else None
+                    if old_key and old_key != new.key:
+                        report.append(f"❌ {url} ведёт на другой товар ({new.name} {new.product_id}), а в посте — {old_key}. Не заменил.")
+                        continue
+                    idx = 0
+            else:
+                # Не удалось раскрыть (например, Ozon) — ставим по порядку на свободное место
+                idx = next((i for i in range(len(anchors)) if i not in replaced), None)
+                if idx is not None:
+                    report.append(f"⚠️ {url}: не смог проверить товар — поставил на место ссылки №{idx + 1}, проверьте.")
+            if idx is None:
+                report.append(f"❌ {url}: не нашёл, какую ссылку в посте заменить.")
+                continue
+            caption = caption.replace(f'<a href="{anchors[idx]}">', f'<a href="{html_escape(url)}">', 1)
+            replaced.add(idx)
+            if not any(r.startswith(f"⚠️ {url}") for r in report):
+                report.append(f"✅ Ссылка №{idx + 1} заменена" + (f" ({new.name})" if new else ""))
+        # Предупреждения о ссылках, которые теперь заменены, больше не нужны
+        names = {(anchor_links[i].name if anchor_links[i] else "") for i in replaced}
+        notes = [w for w in (item["note"] or "").splitlines() if not any(n and n in w for n in names)]
+        await self.db.update(item_id, caption=caption, note="\n".join(notes) or None)
+        return await self.db.get(item_id), report
+
+    # ---------- 3. публикация ----------
+
+    async def publish_next(self, key: str) -> None:
+        p = self.profiles[key]
+        items = await self.db.by_status(key, "approved", limit=1, order="approved_at, id")
+        if not items:
+            log.info("[%s] очередь пуста — слот пропущен", key)
+            return
+        await self.publish(p, items[0])
+
+    async def publish(self, p: ChannelProfile, item: dict) -> None:
+        try:
+            if visible_len(item["caption"] or "") <= CAPTION_LIMIT:
+                await send_post(self.bot, p.target, item["media"], item["caption"])
+            else:  # запасной вариант: медиа отдельно, текст отдельным сообщением
+                await send_post(self.bot, p.target, item["media"], None)
+                await self.bot.send_message(p.target, item["caption"])
+        except Exception as e:
+            log.exception("[%s] публикация item %s упала", p.key, item["id"])
+            await self.db.update(item["id"], status="failed", note=f"publish: {e}"[:500])
+            await self._notify(p, f"⚠️ Не удалось опубликовать #{item['id']}: {e}")
+            return
+        await self.db.update(item["id"], status="published")
+        self._cleanup(item)
+        log.info("[%s] опубликован item %s", p.key, item["id"])
+
+    # ---------- 3б. отложенные сообщения в канале ----------
+
+    def uses_scheduled(self, p: ChannelProfile) -> bool:
+        return p.publish_mode == "scheduled" and self.channel_scheduler is not None
+
+    async def sync_job(self, key: str) -> None:
+        if self._sync_locks[key].locked():
+            return
+        async with self._sync_locks[key]:
+            try:
+                await self.sync_schedule(self.profiles[key])
+            except Exception:
+                log.exception("[%s] синхронизация отложенных упала", key)
+
+    async def sync_schedule(self, p: ChannelProfile) -> None:
+        """Сверяем базу с «Отложенными» канала и добавляем туда одобренные посты, пока есть место."""
+        if not self.uses_scheduled(p):
+            return
+        sch = self.channel_scheduler
+        if not await sch.can_post(p.target):
+            if self._limit_notified.get(f"perm:{p.key}"):
+                return
+            self._limit_notified[f"perm:{p.key}"] = True
+            await self._notify(p, f"⚠️ Аккаунт-читатель не может публиковать в {p.target}. Сделайте его "
+                                  "администратором канала с правом публикации — до тех пор одобренные посты ждут в очереди.")
+            return
+        self._limit_notified[f"perm:{p.key}"] = False
+        existing = await sch.scheduled(p.target)
+        present = {m.id for m in existing}
+        occupied = {_minute(m.date) for m in existing}
+        now = datetime.now(timezone.utc)
+
+        # 1) что уже вышло или было удалено вручную
+        for it in await self.db.by_status(p.key, "scheduled", limit=1000):
+            if any(i in present for i in it["tg_msg_ids"]):
+                continue
+            when = datetime.fromisoformat(it["scheduled_at"]) if it["scheduled_at"] else now
+            if when <= now + timedelta(minutes=1):
+                await self.db.update(it["id"], status="published")
+            else:
+                await self.db.update(it["id"], status="rejected", note="удалён из отложенных вручную")
+
+        # 2) одобренные -> в отложенные, пока не упрёмся в лимит
+        count = len(existing)
+        for it in await self.db.by_status(p.key, "approved", limit=1000, order="approved_at, id"):
+            need = min(len(it["media"]), 10) or 1
+            if count + need > p.max_scheduled:
+                self._limit_reached(p, count)
+                break
+            slot = next_slot(p, occupied, now)
+            if not slot:
+                log.warning("[%s] нет свободных слотов в расписании на 60 дней вперёд", p.key)
+                break
+            try:
+                ids = await sch.schedule(p.target, it["media"], it["caption"] or "", slot)
+            except ScheduleTooMuchError:
+                self._limit_reached(p, count)
+                break
+            except Exception as e:
+                log.exception("[%s] не удалось поставить #%s в отложенные", p.key, it["id"])
+                await self.db.update(it["id"], status="failed", note=f"schedule: {e}"[:500])
+                await self._notify(p, f"⚠️ Не удалось поставить #{it['id']} в отложенные: {e}")
+                continue
+            occupied.add(_minute(slot))
+            count += len(ids)
+            self._limit_notified[p.key] = False
+            await self.db.update(it["id"], status="scheduled", scheduled_at=slot.isoformat(timespec="seconds"),
+                                 tg_msg_ids=ids)
+            log.info("[%s] #%s в отложенных на %s", p.key, it["id"], slot.astimezone(ZoneInfo(p.timezone)))
+            await self._mark_control(p, await self.db.get(it["id"]))
+            self._cleanup(it)
+
+    def _limit_reached(self, p: ChannelProfile, count: int) -> None:
+        if not self._limit_notified.get(p.key):
+            log.info("[%s] лимит отложенных (%s/%s) — остальное добавлю, когда освободится место",
+                     p.key, count, p.max_scheduled)
+            self._limit_notified[p.key] = True
+
+    async def _mark_control(self, p: ChannelProfile, item: dict) -> None:
+        """Дописать в сообщение модерации, на когда поставлен пост."""
+        if not item["draft_msg_ids"]:
+            return
+        local = datetime.fromisoformat(item["scheduled_at"]).astimezone(ZoneInfo(p.timezone))
+        try:
+            await self.bot.edit_message_text(
+                _control_text(p, item) + f"\n\n🗓 В отложенных канала на {local:%d.%m %H:%M}",
+                chat_id=self.moderation_chat(p), message_id=item["draft_msg_ids"][-1])
+        except TelegramBadRequest:
+            pass
+
+    # ---------- helpers ----------
+
+    async def _notify(self, p: ChannelProfile, text: str) -> None:
+        try:
+            await self.bot.send_message(self.moderation_chat(p), html_escape(text))
+        except Exception:
+            log.exception("не удалось уведомить модератора")
+
+    async def delete_draft_media(self, item: dict) -> None:
+        """Убрать медиа черновика из чата модерации (управляющее сообщение остаётся)."""
+        p = self.profiles[item["channel"]]
+        for mid in item["draft_msg_ids"][:-1]:
+            try:
+                await self.bot.delete_message(self.moderation_chat(p), mid)
+            except TelegramBadRequest:
+                pass
+
+    def _cleanup(self, item: dict) -> None:
+        dirs = {Path(m.path).parent for m in item["media"]}
+        for d in dirs:
+            if self.settings.media_dir in d.parents:
+                shutil.rmtree(d, ignore_errors=True)
+
+
+def moderation_kb(item_id: int, deal: bool = False):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ В очередь", callback_data=f"mod:approve:{item_id}")
+    kb.button(text="🚀 Сейчас", callback_data=f"mod:now:{item_id}")
+    kb.button(text="🔄 Переписать", callback_data=f"mod:regen:{item_id}")
+    kb.button(text="✏️ Изменить", callback_data=f"mod:edit:{item_id}")
+    if deal:
+        kb.button(text="🔗 Ссылка", callback_data=f"mod:link:{item_id}")
+    kb.button(text="❌ Пропустить", callback_data=f"mod:skip:{item_id}")
+    kb.adjust(2, 2, 2) if deal else kb.adjust(2, 2, 1)
+    return kb.as_markup()
+
+
+def _control_text(p: ChannelProfile, item: dict) -> str:
+    """Предпросмотр для модератора (HTML): служебная шапка + карточка как она будет в канале."""
+    caption = item["caption"] or ""
+    n = visible_len(caption)
+    warn = f"\n\n⚠️ {n} симв. — больше лимита подписи {CAPTION_LIMIT}" if n > CAPTION_LIMIT else ""
+    if item.get("note") and item.get("status") in ("draft", "pending", "approved"):
+        warn += "".join(f"\n⚠️ {html_escape(w)}" for w in item["note"].splitlines())
+    views = f" · 👁 {item['views']}" if item.get("views") else ""
+    src = html_escape(item["url"] or item["source"])
+    return (f"<i>📝 Черновик #{item['id']} → {html_escape(p.title)}\nИсточник: {src}{views}</i>\n"
+            f"────────────\n{caption}{warn}")
+
+
+def _minute(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M")
+
+
+def next_slot(p: ChannelProfile, occupied: set[str], now: datetime, days: int = 60) -> datetime | None:
+    """Ближайший слот расписания канала, не занятый другим отложенным сообщением."""
+    tz = ZoneInfo(p.timezone)
+    earliest = now + timedelta(minutes=p.min_lead_minutes)
+    times = sorted(dtime(int(t.split(":")[0]), int(t.split(":")[1])) for t in p.schedule)
+    day = earliest.astimezone(tz).date()
+    for _ in range(days):
+        for t in times:
+            slot = datetime.combine(day, t, tzinfo=tz)
+            if slot > earliest and _minute(slot) not in occupied:
+                return slot
+        day += timedelta(days=1)
+    return None

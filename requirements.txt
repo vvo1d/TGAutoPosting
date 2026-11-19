@@ -1,0 +1,15 @@
+anthropic>=2.10
+aiogram>=3.32
+telethon>=1.46
+aiosqlite>=0.22
+apscheduler>=3.11,<4
+pydantic>=2.14
+pydantic-settings>=2.16
+pyyaml>=6
+httpx>=0.28
+feedparser>=6
+beautifulsoup4>=4.15
+pillow>=13
+openai>=1.0
+qrcode>=7
+hachoir>=3

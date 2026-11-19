@@ -1,0 +1,110 @@
+# Профиль канала ShopSparks — выгодные находки на маркетплейсах.
+key: shop_sparks
+title: ShopSparks
+content_type: deal                 # находки: ссылки раскрываются и заменяются на партнёрские
+target: "@ShopSparks"              # бот и аккаунт-читатель должны быть админами канала
+timezone: Europe/Moscow
+# Скидки быстро заканчиваются — слоты чаще, чем у рецептов
+schedule: ["09:00", "11:00", "13:00", "15:00", "17:00", "19:00", "21:00"]
+publish_mode: scheduled
+collect_every_minutes: 30
+max_pending_drafts: 10
+dedup_days: 30                     # один и тот же товар не повторяем 30 дней
+
+# ---------- Партнёрские ссылки ----------
+# Шаблоны по площадкам. Подстановки: {url} — чистая ссылка на товар, {url_encoded} — она же для
+# параметра (?ulp=…), {id} — id товара. Пока шаблон пустой — в пост ставится чистая ссылка на товар
+# без чужих меток, а в черновике будет предупреждение.
+# Пример для AliExpress через Admitad (deeplink): "https://ad.admitad.com/g/ВАШ_КОД/?ulp={url_encoded}"
+affiliate:
+  wb: null
+  ozon: null
+  ali: null
+  ym: null
+
+# Посты с партнёрскими ссылками по закону о рекламе (РФ) нужно маркировать: «Реклама», рекламодатель
+# и токен erid (его выдаёт партнёрская сеть). Если сеть даёт общий текст маркировки — впишите сюда.
+ad_footer: null
+
+# Яндекс Маркет «Товары с наградой»: собираете ссылки «Поделиться» сами и отправляете боту одним сообщением
+# (по ссылке в строке). Бот без входа в ваш аккаунт берёт с карточки название, цены, рейтинг и фото, а в посте
+# оставляет вашу реферальную ссылку как есть. Такие товары обрабатываются первыми.
+
+sources:
+  # Проверено 19.11.2026 через t.me/s/: каналы активны, цифры примерные.
+  # min_age_hours: берём пост через N часов, чтобы по просмотрам выбрать лучшие; max_age_hours: старые скидки не берём.
+  telegram:
+    # --- Wildberries ---
+    - username: nakhodki            # Находки ВБ: ~19K подп., ~4K просм., прямые ссылки WB
+      min_age_hours: 2
+      max_age_hours: 24
+      min_views: 1500
+    - username: skidka7             # Скидка 7 | Дикие: ~102K, ~500 просм., WB
+      min_age_hours: 2
+      max_age_hours: 24
+      min_views: 300
+    - username: wildberriesyour     # Этот ваш Wildberries: ~43K, ~200 просм., WB + Маркет
+      min_age_hours: 2
+      max_age_hours: 24
+      min_views: 120
+    # --- Яндекс Маркет / Ozon / смешанные ---
+    - username: hey_lovi_skidku     # Хей, лови скидку: ~149K, ~5K просм., Маркет + WB
+      min_age_hours: 2
+      max_age_hours: 24
+      min_views: 2000
+    - username: wb_shmotka          # Топ Шмотка | ВБ, ОЗОН: ~85K, ~2K просм., Маркет
+      min_age_hours: 2
+      max_age_hours: 24
+      min_views: 800
+    - username: elyaproshopping     # Эля ПроШопинг: ~44K, ~1K просм., Ozon + Маркет + Ali
+      min_age_hours: 2
+      max_age_hours: 24
+      min_views: 400
+    - username: sonyaskidkaa        # Соня со скидкой: ~16K, ~500 просм., WB + Ozon + Маркет
+      min_age_hours: 2
+      max_age_hours: 24
+      min_views: 200
+    # --- AliExpress ---
+    - username: alishopping_guru    # Alishopping_guru: ~164K, ~4–10K просм.
+      min_age_hours: 2
+      max_age_hours: 48
+      min_views: 2000
+    - username: halyavshiki         # Халявщики: ~445K, ~2.5K просм., Ali + Маркет (много рекламы — отсеется)
+      min_age_hours: 2
+      max_age_hours: 24
+      min_views: 1000
+    - username: mensaliexress       # Мужской AliExpress: ~15K, ~200 просм., Ali + Маркет
+      min_age_hours: 2
+      max_age_hours: 48
+      min_views: 100
+
+    # --- крупные приватные (по данным Telemetr), нужна ссылка-приглашение t.me/+XXXX ---
+    # - invite: https://t.me/+XXXX
+    #   name: WB Sniper | Находки с Wildberries        # ~861K
+    # - invite: https://t.me/+XXXX
+    #   name: Wildberries | находки                    # ~751K
+    # - invite: https://t.me/+XXXX
+    #   name: WB Radar | Находки с Wildberries         # ~600K, ~14K просм.
+    # - invite: https://t.me/+XXXX
+    #   name: Секретный Wildberries                    # ~546K
+    # - invite: https://t.me/+XXXX
+    #   name: Скидки на Маркете                        # ~952K, ~23K просм.
+    # - invite: https://t.me/+XXXX
+    #   name: Барахляндия | Скидки на WB, OZON          # ~482K
+
+rubrics: [одежда, обувь, дом, кухня, красота, здоровье, техника, гаджеты, дети, авто, спорт, подарки, продукты, хобби]
+
+style: |
+  - title: что за товар и в чём выгода, 3–8 слов. Например: «Тёплый плед за полцены», «Беспроводные наушники до 1500 ₽».
+  - intro: 1–2 живых предложения — чем товар полезен в жизни, для кого он. Без цены (цена — в строке товара),
+    без канцелярита и восклицательных знаков в каждом предложении.
+  - Название товара в items — коротко и понятно человеку, без артикулов, размеров и кодов цвета.
+  - Тон: дружелюбный, как совет от друга, который нашёл классную вещь.
+
+examples:
+  - |
+    Уютный плед, который не жалко взять на дачу 🧶
+    Мягкий, тёплый и стирается в машинке — идеальный вариант на холодные вечера.
+
+    🔥 Плед флисовый 150×200 — 799 ₽ (было 1 990 ₽)
+    🛒 Смотреть на Wildberries
