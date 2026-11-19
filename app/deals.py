@@ -15,6 +15,8 @@ from app.config import ChannelProfile
 from app.links import ProductLink, affiliate_url
 
 CAPTION_LIMIT = 1024
+# Критичные предупреждения: пост нельзя публиковать без проверки человеком (даже если проверка выключена)
+CRITICAL = "‼️ "
 
 
 class DealItem(BaseModel):
@@ -113,12 +115,12 @@ def format_deal(post: DealPost, links: list[ProductLink], profile: ChannelProfil
             if not url:
                 url = link.url
                 if not link.product_id:
-                    warnings.append(f"ссылку {link.name} не удалось раскрыть — замените вручную: {link.url}")
+                    warnings.append(f"{CRITICAL}ссылку {link.name} не удалось раскрыть — замените вручную: {link.url}")
                 else:
                     warnings.append(f"партнёрская ссылка для {link.name} не настроена — стоит чистая ссылка")
             line += f'\n🛒 <a href="{_e(url)}">Смотреть на {link.name}</a>'
         else:
-            warnings.append(f"у товара «{item.name}» нет ссылки")
+            warnings.append(f"{CRITICAL}у товара «{item.name}» нет ссылки")
         blocks.append(line)
     if blocks:
         parts.append("\n\n".join(blocks))

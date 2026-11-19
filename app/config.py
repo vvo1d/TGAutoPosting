@@ -164,6 +164,14 @@ class ChannelProfile(BaseModel):
     # scheduled — одобренные посты уходят в «Отложенные» канала (через аккаунт-читатель, он должен быть админом);
     # bot — бот сам публикует из очереди в слоты расписания
     publish_mode: str = "scheduled"
+    # Для publish_mode=scheduled: N постов в день, время — случайное, но равномерно: окно day_start–day_end
+    # делится на N равных интервалов, в каждом — один пост в случайную минуту.
+    # posts_per_day и moderation можно менять из бота (/channels) — там значения хранятся в базе.
+    posts_per_day: int | None = None  # по умолчанию — столько, сколько слотов в schedule
+    day_start: str = "08:00"
+    day_end: str = "23:00"
+    moderation: bool = True           # True — черновики на проверку; False — сразу в отложенные
+    buffer_days: int = 2              # без проверки: готовим посты на столько дней вперёд
     max_scheduled: int = 100          # лимит Telegram на отложенные сообщения в чате
     min_lead_minutes: int = 15        # ближайший слот — не раньше чем через N минут
     collect_every_minutes: int = 30

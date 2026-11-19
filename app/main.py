@@ -61,9 +61,10 @@ async def main() -> None:
         scheduler.add_job(pipeline.process_job, "interval", args=[key], id=f"process:{key}",
                           minutes=1, next_run_time=start + timedelta(seconds=20), max_instances=1, coalesce=True)
         if p.publish_mode == "scheduled" and tg:
-            # Одобренные посты -> «Отложенные» канала: при старте и каждые 10 минут (освобождается место в лимите)
+            # Одобренные посты -> «Отложенные» канала: при старте и каждые 5 минут
+            # (удалённый вручную пост освобождает интервал — туда сразу встаёт следующий)
             scheduler.add_job(pipeline.sync_job, "interval", args=[key], id=f"sync:{key}",
-                              minutes=10, next_run_time=start + timedelta(seconds=5), max_instances=1, coalesce=True)
+                              minutes=5, next_run_time=start + timedelta(seconds=5), max_instances=1, coalesce=True)
         else:
             slots = [CronTrigger(hour=int(t.split(":")[0]), minute=int(t.split(":")[1]), timezone=p.timezone)
                      for t in p.schedule]
@@ -80,6 +81,7 @@ async def main() -> None:
         BotCommand(command="status", description="Статистика и очередь"),
         BotCommand(command="collect", description="Собрать посты сейчас"),
         BotCommand(command="publish", description="Опубликовать следующий из очереди"),
+        BotCommand(command="channels", description="Проверка вкл/выкл, постов в день"),
         BotCommand(command="pause", description="Пауза сбора/постинга (кнопки — в /status)"),
         BotCommand(command="resume", description="Снять паузу"),
         BotCommand(command="server", description="Версия, диск, прокси"),

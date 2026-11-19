@@ -47,6 +47,7 @@ async def cmd_help(msg: Message) -> None:
         "/status — статистика и очередь\n"
         "/collect — собрать и подготовить посты сейчас\n"
         "/publish &lt;канал&gt; — опубликовать следующий из очереди\n"
+        "/channels — проверка вкл/выкл и число постов в день для каждого канала\n"
         "/pause, /resume [канал] [сбор|постинг] — пауза; без аргументов — всё. Кнопки паузы — под /status\n"
         "/server — версия, диск, прокси · /logs [N] — последние строки лога\n"
         "/update — обновить из GitHub и перезапуститься · /restart — перезапуск\n\n"
@@ -377,3 +378,83 @@ async def cmd_update(msg: Message) -> None:
     _, commit = await _run("git", "log", "-1", "--format=%h %s")
     await msg.answer(f"✅ Обновлено до {html_escape(commit.strip())}\n<pre>{html_escape(out[-1500:])}</pre>\nПерезапускаюсь…")
     _restart_soon()
+
+
+# ---------- настройки каналов: проверка и постов в день ----------
+
+async def _channels_text(pipeline: Pipeline) -> str:
+    lines = ["<b>Каналы</b>"]
+    for key, p in pipeline.profiles.items():
+        mod = await pipeline.moderation(key)
+        ppd = await pipeline.posts_per_day(key)
+        lines.append(
+            f"\n<b>{html_escape(p.title)}</b> ({key})\n"
+            f"Проверка: {'🛡 включена — черновики приходят вам' if mod else '⚡️ выключена — сразу в отложенные'}\n"
+            f"Постов в день: <b>{ppd}</b> · окно {p.day_start}–{p.day_end}, "
+            f"примерно раз в {_fmt_interval(p, ppd)}, время случайное")
+    lines.append("\nУдалённый вручную пост из отложенных заменяется следующим из очереди (проверка раз в 5 минут).")
+    return "\n".join(lines)
+
+
+def _fmt_interval(p, ppd: int) -> str:
+    from app.pipeline import day_intervals
+    from datetime import date
+    a, b = day_intervals(p, date.today(), ppd)[0]
+    mins = int((b - a).total_seconds() // 60)
+    return f"{mins // 60} ч {mins % 60:02d} мин" if mins >= 60 else f"{mins} мин"
+
+
+async def _channels_kb(pipeline: Pipeline):
+    kb = InlineKeyboardBuilder()
+    sizes = []
+    for key, p in pipeline.profiles.items():
+        mod = await pipeline.moderation(key)
+        kb.button(text=f"{'🛡 Проверка: вкл' if mod else '⚡️ Проверка: выкл'} · {p.title}", callback_data=f"chan:{key}:mod")
+        ppd = await pipeline.posts_per_day(key)
+        kb.button(text="−", callback_data=f"chan:{key}:ppd:-1")
+        kb.button(text=f"{ppd} в день", callback_data=f"chan:{key}:noop")
+        kb.button(text="+", callback_data=f"chan:{key}:ppd:1")
+        sizes += [1, 3]
+    kb.adjust(*sizes)
+    return kb.as_markup()
+
+
+@router.message(Command("channels"))
+async def cmd_channels(msg: Message, pipeline: Pipeline) -> None:
+    await msg.answer(await _channels_text(pipeline), reply_markup=await _channels_kb(pipeline))
+
+
+@router.callback_query(F.data.startswith("chan:"))
+async def on_channel_setting(cb: CallbackQuery, pipeline: Pipeline) -> None:
+    parts = cb.data.split(":")
+    key, action = parts[1], parts[2]
+    if key not in pipeline.profiles:
+        await cb.answer("Неизвестный канал", show_alert=True)
+        return
+    p = pipeline.profiles[key]
+    if action == "noop":
+        await cb.answer("Кнопками − и + меняется число постов в день. Точное значение: /ppd канал число")
+        return
+    if action == "mod":
+        on = not await pipeline.moderation(key)
+        await pipeline.set_moderation(key, on)
+        await cb.answer(f"{p.title}: проверка {'включена' if on else 'выключена'}")
+        if not on:
+            asyncio.create_task(pipeline.process_job(key))
+    elif action == "ppd":
+        n = await pipeline.set_posts_per_day(key, await pipeline.posts_per_day(key) + int(parts[3]))
+        await cb.answer(f"{p.title}: {n} постов в день")
+        asyncio.create_task(pipeline.sync_job(key))
+    await cb.message.edit_text(await _channels_text(pipeline), reply_markup=await _channels_kb(pipeline))
+
+
+@router.message(Command("ppd"))
+async def cmd_ppd(msg: Message, command: CommandObject, pipeline: Pipeline) -> None:
+    args = (command.args or "").split()
+    if len(args) != 2 or args[0] not in pipeline.profiles or not args[1].isdigit():
+        await msg.answer(f"Формат: /ppd канал число, например /ppd shop_sparks 12. Каналы: {', '.join(pipeline.profiles)}")
+        return
+    n = await pipeline.set_posts_per_day(args[0], int(args[1]))
+    asyncio.create_task(pipeline.sync_job(args[0]))
+    await msg.answer(f"Готово: {n} постов в день.\n\n" + await _channels_text(pipeline),
+                     reply_markup=await _channels_kb(pipeline))

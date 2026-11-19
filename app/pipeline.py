@@ -74,6 +74,25 @@ class Pipeline:
         await self.db.set_flag(f"pause:{key}:{what}", "1" if paused else None)
         log.info("[%s] %s: %s", key, what, "пауза" if paused else "возобновлено")
 
+    # ---------- настройки канала (меняются из бота, хранятся в базе) ----------
+
+    async def posts_per_day(self, key: str) -> int:
+        v = await self.db.get_flag(f"cfg:{key}:ppd")
+        p = self.profiles[key]
+        return int(v) if v else (p.posts_per_day or len(p.schedule) or 5)
+
+    async def set_posts_per_day(self, key: str, n: int) -> int:
+        n = max(1, min(48, n))
+        await self.db.set_flag(f"cfg:{key}:ppd", str(n))
+        return n
+
+    async def moderation(self, key: str) -> bool:
+        v = await self.db.get_flag(f"cfg:{key}:moderation")
+        return self.profiles[key].moderation if v is None else v == "1"
+
+    async def set_moderation(self, key: str, on: bool) -> None:
+        await self.db.set_flag(f"cfg:{key}:moderation", "1" if on else "0")
+
     async def collect_job(self, key: str) -> None:
         if await self.is_paused(key, "collect"):
             return
@@ -158,7 +177,13 @@ class Pipeline:
 
     async def process(self, p: ChannelProfile) -> None:
         counts = await self.db.count(p.key)
+        moderated = await self.moderation(p.key)
         free = p.max_pending_drafts - counts.get("pending", 0)
+        if not moderated:
+            # Без проверки: готовим ровно столько, чтобы хватило на buffer_days дней вперёд
+            target = await self.posts_per_day(p.key) * p.buffer_days
+            free = (target - counts.get("approved", 0) - counts.get("pending", 0)
+                    - await self._future_scheduled(p.key))
         if free <= 0:
             return
         new_items = await self.db.by_status(p.key, "new", limit=1000)
@@ -167,11 +192,17 @@ class Pipeline:
                 it["phash"] = h
                 await self.db.update(it["id"], phash=h)
         items = self._mix_sources(new_items)[:free]
+        auto_added = 0
         for item in items:
             try:
                 ok = await self._rewrite_item(p, item)
                 if ok:
-                    await self.send_draft(p, await self.db.get(item["id"]))
+                    draft = await self.db.get(item["id"])
+                    if moderated or deals.CRITICAL in (draft["note"] or ""):  # битая ссылка и т.п. — всегда на проверку
+                        await self.send_draft(p, draft)
+                    else:
+                        await self.db.update(item["id"], status="approved")
+                        auto_added += 1
             except Exception as e:
                 # Лимит (429), сбой сервера (5xx), нет оплаты (402), модель снята (410), неверный ключ (401):
                 # материал не виноват — оставляем его в очереди и сообщаем модератору
@@ -183,6 +214,9 @@ class Pipeline:
                     return
                 log.exception("[%s] item %s: ошибка обработки", p.key, item["id"])
                 await self.db.update(item["id"], status="failed", note=str(e)[:500])
+        if auto_added:
+            log.info("[%s] без проверки: %d постов сразу в очередь отложенных", p.key, auto_added)
+            asyncio.create_task(self.sync_job(p.key))
 
     @staticmethod
     def _mix_sources(items: list[dict]) -> list[dict]:
@@ -208,6 +242,12 @@ class Pipeline:
         await self.db.update(item["id"], status="rejected", note=note)
         self._cleanup(item)
         return False
+
+    async def _future_scheduled(self, key: str) -> int:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        cur = await self.db.conn.execute(
+            "SELECT COUNT(*) FROM items WHERE channel=? AND status='scheduled' AND scheduled_at>?", (key, now))
+        return (await cur.fetchone())[0]
 
     async def _rewrite_item(self, p: ChannelProfile, item: dict, note: str | None = None) -> bool:
         # Явная реклама — не тратим запрос к модели (только для рецептов: в находках «скидка» и erid — норма)
@@ -444,8 +484,9 @@ class Pipeline:
         self._limit_notified[f"perm:{p.key}"] = False
         existing = await sch.scheduled(p.target)
         present = {m.id for m in existing}
-        occupied = {_minute(m.date) for m in existing}
+        occupied = [m.date for m in existing]
         now = datetime.now(timezone.utc)
+        ppd = await self.posts_per_day(p.key)
 
         # 1) что уже вышло или было удалено вручную
         for it in await self.db.by_status(p.key, "scheduled", limit=1000):
@@ -464,9 +505,9 @@ class Pipeline:
             if count + need > p.max_scheduled:
                 self._limit_reached(p, count)
                 break
-            slot = next_slot(p, occupied, now)
+            slot = next_slot(p, occupied, now, ppd)
             if not slot:
-                log.warning("[%s] нет свободных слотов в расписании на 60 дней вперёд", p.key)
+                log.warning("[%s] нет свободных интервалов на 60 дней вперёд", p.key)
                 break
             try:
                 ids = await sch.schedule(p.target, it["media"], it["caption"] or "", slot)
@@ -478,7 +519,7 @@ class Pipeline:
                 await self.db.update(it["id"], status="failed", note=f"schedule: {e}"[:500])
                 await self._notify(p, f"⚠️ Не удалось поставить #{it['id']} в отложенные: {e}")
                 continue
-            occupied.add(_minute(slot))
+            occupied.append(slot)
             count += len(ids)
             self._limit_notified[p.key] = False
             await self.db.update(it["id"], status="scheduled", scheduled_at=slot.isoformat(timespec="seconds"),
@@ -548,7 +589,7 @@ def _control_text(p: ChannelProfile, item: dict) -> str:
     n = visible_len(caption)
     warn = f"\n\n⚠️ {n} симв. — больше лимита подписи {CAPTION_LIMIT}" if n > CAPTION_LIMIT else ""
     if item.get("note") and item.get("status") in ("draft", "pending", "approved"):
-        warn += "".join(f"\n⚠️ {html_escape(w)}" for w in item["note"].splitlines())
+        warn += "".join(f"\n{'' if w.startswith(deals.CRITICAL) else '⚠️ '}{html_escape(w)}" for w in item["note"].splitlines())
     views = f" · 👁 {item['views']}" if item.get("views") else ""
     src = html_escape(item["url"] or item["source"])
     return (f"<i>📝 Черновик #{item['id']} → {html_escape(p.title)}\nИсточник: {src}{views}</i>\n"
@@ -559,16 +600,44 @@ def _minute(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M")
 
 
-def next_slot(p: ChannelProfile, occupied: set[str], now: datetime, days: int = 60) -> datetime | None:
-    """Ближайший слот расписания канала, не занятый другим отложенным сообщением."""
+def day_intervals(p: ChannelProfile, day, ppd: int) -> list[tuple[datetime, datetime]]:
+    """Окно публикаций дня (day_start–day_end), поделённое на ppd равных интервалов."""
+    tz = ZoneInfo(p.timezone)
+
+    def at(hhmm: str, d):
+        h, m = (int(x) for x in hhmm.split(":"))
+        if h >= 24:  # «24:00» — конец суток
+            return datetime.combine(d + timedelta(days=1), dtime(0, 0), tzinfo=tz)
+        return datetime.combine(d, dtime(h, m), tzinfo=tz)
+
+    a0, b0 = at(p.day_start, day), at(p.day_end, day)
+    if b0 <= a0:  # окно через полночь, например 20:00–02:00
+        b0 += timedelta(days=1)
+    step = (b0 - a0) / ppd
+    return [(a0 + i * step, a0 + (i + 1) * step) for i in range(ppd)]
+
+
+def next_slot(p: ChannelProfile, occupied: list[datetime], now: datetime, ppd: int,
+              rng: random.Random | None = None, days: int = 60) -> datetime | None:
+    """Ближайший свободный интервал (без других отложенных сообщений) и случайная минута в нём.
+    Случайность — в средних 80% интервала, чтобы соседние посты не слипались на границах."""
+    rng = rng or random
     tz = ZoneInfo(p.timezone)
     earliest = now + timedelta(minutes=p.min_lead_minutes)
-    times = sorted(dtime(int(t.split(":")[0]), int(t.split(":")[1])) for t in p.schedule)
-    day = earliest.astimezone(tz).date()
-    for _ in range(days):
-        for t in times:
-            slot = datetime.combine(day, t, tzinfo=tz)
-            if slot > earliest and _minute(slot) not in occupied:
-                return slot
-        day += timedelta(days=1)
+    first_day = earliest.astimezone(tz).date() - timedelta(days=1)  # окно через полночь могло начаться вчера
+    for d in range(days + 1):
+        for a, b in day_intervals(p, first_day + timedelta(days=d), ppd):
+            if b <= earliest + timedelta(minutes=2):
+                continue
+            if any(a <= t < b for t in occupied):
+                continue
+            lo, hi = a + (b - a) * 0.1, a + (b - a) * 0.9
+            if hi <= earliest:            # текущий интервал почти прошёл — берём остаток до его конца
+                lo, hi = earliest, b - timedelta(minutes=1)
+            lo = max(lo, earliest)
+            if hi <= lo:
+                continue
+            slot = lo + (hi - lo) * rng.random()
+            slot = slot.replace(second=0, microsecond=0)
+            return slot if slot >= earliest else slot + timedelta(minutes=1)
     return None
