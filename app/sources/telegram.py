@@ -31,7 +31,8 @@ class TgCandidate:
 
 class TelegramReader:
     def __init__(self, settings: Settings):
-        self.client = TelegramClient(str(settings.session_path), settings.tg_api_id, settings.tg_api_hash)
+        self.client = TelegramClient(str(settings.session_path), settings.tg_api_id, settings.tg_api_hash,
+                                     proxy=settings.telethon_proxy)
         self._invite_cache: dict[str, object] = {}
 
     async def start(self) -> None:

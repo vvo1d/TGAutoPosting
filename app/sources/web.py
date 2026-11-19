@@ -24,11 +24,15 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; RecipeCollector/1.0)"}
 
 
 class WebReader:
-    def __init__(self):
+    def __init__(self, tg_proxy: str | None = None):
         self.http = httpx.AsyncClient(headers=HEADERS, timeout=30, follow_redirects=True)
+        # telegra.ph — сервис Telegram: ходим к нему через тот же прокси, что и к Telegram
+        self.tg_http = httpx.AsyncClient(headers=HEADERS, timeout=30, follow_redirects=True,
+                                         proxy=tg_proxy.replace("socks5h://", "socks5://") if tg_proxy else None)
 
     async def stop(self) -> None:
         await self.http.aclose()
+        await self.tg_http.aclose()
 
     async def list_urls(self, src: WebSource) -> list[str]:
         urls = list(src.urls)
@@ -89,7 +93,7 @@ class WebReader:
         if not m:
             return None
         try:
-            r = await self.http.get(f"https://api.telegra.ph/getPage/{m.group(1)}", params={"return_content": "true"})
+            r = await self.tg_http.get(f"https://api.telegra.ph/getPage/{m.group(1)}", params={"return_content": "true"})
             r.raise_for_status()
             data = r.json()
         except (httpx.HTTPError, ValueError) as e:

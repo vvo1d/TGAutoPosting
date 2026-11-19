@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.types import BotCommand
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.combining import OrTrigger
@@ -25,21 +27,29 @@ from app.sources.web import WebReader
 
 
 async def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    settings = Settings()
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    # Лог в консоль и в файл (команда /logs в боте читает файл)
+    fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    file_handler = RotatingFileHandler(settings.log_path, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+    logging.basicConfig(level=logging.INFO, format=fmt, handlers=[logging.StreamHandler(), file_handler])
     logging.getLogger("httpx").setLevel(logging.WARNING)
     log = logging.getLogger("app")
 
-    settings = Settings()
     profiles = load_profiles()
     db = DB(settings.db_path)
     await db.connect()
 
-    bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode="HTML", link_preview_is_disabled=True))
+    session = AiohttpSession(proxy=settings.tg_proxy) if settings.tg_proxy else None
+    if settings.tg_proxy:
+        log.info("Telegram через прокси %s", settings.tg_proxy)
+    bot = Bot(settings.bot_token, session=session,
+              default=DefaultBotProperties(parse_mode="HTML", link_preview_is_disabled=True))
     tg = None
     if any(p.sources.telegram for p in profiles.values()):
         tg = TelegramReader(settings)
         await tg.start()
-    web = WebReader()
+    web = WebReader(settings.tg_proxy)
     pipeline = Pipeline(settings, profiles, db, bot, tg, web, Rewriter(settings))
 
     scheduler = AsyncIOScheduler()
@@ -70,6 +80,10 @@ async def main() -> None:
         BotCommand(command="status", description="Статистика и очередь"),
         BotCommand(command="collect", description="Собрать посты сейчас"),
         BotCommand(command="publish", description="Опубликовать следующий из очереди"),
+        BotCommand(command="server", description="Версия, диск, прокси"),
+        BotCommand(command="logs", description="Последние строки лога"),
+        BotCommand(command="update", description="Обновить из GitHub и перезапуститься"),
+        BotCommand(command="restart", description="Перезапустить приложение"),
     ])
 
     try:

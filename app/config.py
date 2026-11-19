@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     bot_token: str
     tg_api_id: int
     tg_api_hash: str
+    # Прокси только для Telegram (бот, аккаунт-читатель, telegra.ph). Остальное — напрямую.
+    # Например: socks5://127.0.0.1:1080 или http://127.0.0.1:8118. Пусто — без прокси.
+    tg_proxy: str | None = None
     admin_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
 
     # Обработка текста: "openai" — любой OpenAI-совместимый API (OVH, Groq, OpenRouter, SambaNova…);
@@ -49,6 +52,24 @@ class Settings(BaseSettings):
     @property
     def media_dir(self) -> Path:
         return self.data_dir / "media"
+
+    @property
+    def telethon_proxy(self) -> dict | None:
+        """TG_PROXY в формате Telethon (python-socks)."""
+        if not self.tg_proxy:
+            return None
+        from urllib.parse import urlparse
+
+        u = urlparse(self.tg_proxy)
+        proxy_type = {"socks5": "socks5", "socks5h": "socks5", "socks4": "socks4", "http": "http", "https": "http"}[u.scheme]
+        out = {"proxy_type": proxy_type, "addr": u.hostname, "port": u.port, "rdns": True}
+        if u.username:
+            out.update(username=u.username, password=u.password or "")
+        return out
+
+    @property
+    def log_path(self) -> Path:
+        return self.data_dir / "app.log"
 
     @property
     def session_path(self) -> Path:

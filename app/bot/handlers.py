@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
+import sys
+from pathlib import Path
 
 from aiogram import F, Router
 from aiogram.filters import BaseFilter, Command, CommandObject
@@ -42,7 +45,9 @@ async def cmd_help(msg: Message) -> None:
         "Я веду ваши каналы.\n\n"
         "/status — статистика и очередь\n"
         "/collect — собрать и подготовить посты сейчас\n"
-        "/publish &lt;канал&gt; — опубликовать следующий из очереди\n\n"
+        "/publish &lt;канал&gt; — опубликовать следующий из очереди\n"
+        "/server — версия, диск, прокси · /logs [N] — последние строки лога\n"
+        "/update — обновить из GitHub и перезапуститься · /restart — перезапуск\n\n"
         "Черновики приходят сюда с кнопками. В режиме «✏️ Изменить» пришлите новый текст поста "
         "или (если подключена LLM) начните сообщение с «!», чтобы дать указание модели (например: «! короче и без шагов»)."
     )
@@ -145,7 +150,7 @@ async def on_moderation(cb: CallbackQuery, pipeline: Pipeline) -> None:
         await cb.answer()
 
 
-@router.message(F.text, F.from_user.id.func(lambda uid: uid in pending_links))
+@router.message(F.text, ~F.text.startswith("/"), F.from_user.id.func(lambda uid: uid in pending_links))
 async def on_link_text(msg: Message, pipeline: Pipeline) -> None:
     urls = re.findall(r"https?://\S+", msg.text or "")
     if not urls:
@@ -163,7 +168,7 @@ async def on_link_text(msg: Message, pipeline: Pipeline) -> None:
     await pipeline.db.update(item_id, status="pending", draft_msg_ids=item["draft_msg_ids"] + [ctrl.message_id])
 
 
-@router.message(F.text, F.from_user.id.func(lambda uid: uid in pending_edits))
+@router.message(F.text, ~F.text.startswith("/"), F.from_user.id.func(lambda uid: uid in pending_edits))
 async def on_edit_text(msg: Message, pipeline: Pipeline) -> None:
     item_id = pending_edits.pop(msg.from_user.id)
     item = await pipeline.db.get(item_id)
@@ -222,3 +227,83 @@ async def on_market_links(msg: Message, pipeline: Pipeline) -> None:
             await pipeline.process_job(profile.key)
 
     asyncio.create_task(run())
+
+
+# ---------- управление приложением на сервере ----------
+
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent
+UNDER_SYSTEMD = bool(os.environ.get("INVOCATION_ID"))  # systemd выставляет переменную своим службам
+
+
+async def _run(*cmd: str, timeout: int = 300) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(*cmd, cwd=ROOT_DIR, stdout=asyncio.subprocess.PIPE,
+                                                stderr=asyncio.subprocess.STDOUT)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return 1, "таймаут"
+    return proc.returncode, out.decode(errors="replace")
+
+
+def _restart_soon() -> None:
+    """Выходим — systemd (Restart=always) поднимет процесс заново через несколько секунд."""
+    asyncio.get_running_loop().call_later(1.5, lambda: os._exit(0))
+
+
+@router.message(Command("logs"))
+async def cmd_logs(msg: Message, command: CommandObject, pipeline: Pipeline) -> None:
+    n = int(command.args) if (command.args or "").strip().isdigit() else 30
+    path = pipeline.settings.log_path
+    if not path.exists():
+        await msg.answer("Лог-файла пока нет.")
+        return
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-min(n, 200):]
+    text = "\n".join(lines)[-3800:]
+    await msg.answer(f"<pre>{html_escape(text)}</pre>" if text else "Лог пуст.")
+
+
+@router.message(Command("server"))
+async def cmd_server(msg: Message, pipeline: Pipeline) -> None:
+    _, commit = await _run("git", "log", "-1", "--format=%h %ci %s")
+    _, disk = await _run("df", "-h", str(ROOT_DIR))
+    media = sum(f.stat().st_size for f in pipeline.settings.media_dir.rglob("*") if f.is_file()) / 1e6 \
+        if pipeline.settings.media_dir.exists() else 0
+    await msg.answer(
+        f"<b>Версия:</b> {html_escape(commit.strip())}\n"
+        f"<b>systemd:</b> {'да' if UNDER_SYSTEMD else 'нет (запущено вручную)'}\n"
+        f"<b>Прокси Telegram:</b> {html_escape(pipeline.settings.tg_proxy or 'нет')}\n"
+        f"<b>Медиа на диске:</b> {media:.0f} МБ\n<pre>{html_escape(disk.strip())}</pre>")
+
+
+@router.message(Command("restart"))
+async def cmd_restart(msg: Message) -> None:
+    if not UNDER_SYSTEMD:
+        await msg.answer("Приложение запущено не как служба systemd — перезапустите его вручную.")
+        return
+    await msg.answer("Перезапускаюсь… Через ~10 секунд проверьте /server.")
+    _restart_soon()
+
+
+@router.message(Command("update"))
+async def cmd_update(msg: Message) -> None:
+    """git pull + зависимости + перезапуск."""
+    if not UNDER_SYSTEMD:
+        await msg.answer("Обновление через бота работает только на сервере (служба systemd).")
+        return
+    await msg.answer("Обновляю код из GitHub…")
+    code, out = await _run("git", "pull", "--ff-only")
+    if code != 0:
+        await msg.answer(f"❌ git pull не удался:\n<pre>{html_escape(out[-3000:])}</pre>")
+        return
+    if "Already up to date" in out or "Уже обновлено" in out:
+        await msg.answer("Новых изменений нет.")
+        return
+    code, pip_out = await _run(sys.executable, "-m", "pip", "install", "-q", "-r", "requirements.txt", timeout=900)
+    if code != 0:
+        await msg.answer(f"❌ Установка зависимостей не удалась, остаюсь на старой версии процесса:\n"
+                         f"<pre>{html_escape(pip_out[-3000:])}</pre>")
+        return
+    _, commit = await _run("git", "log", "-1", "--format=%h %s")
+    await msg.answer(f"✅ Обновлено до {html_escape(commit.strip())}\n<pre>{html_escape(out[-1500:])}</pre>\nПерезапускаюсь…")
+    _restart_soon()

@@ -41,7 +41,7 @@ async def qr_login(client: TelegramClient) -> None:
 async def main() -> None:
     s = Settings()
     s.data_dir.mkdir(parents=True, exist_ok=True)
-    client = TelegramClient(str(s.session_path), s.tg_api_id, s.tg_api_hash)
+    client = TelegramClient(str(s.session_path), s.tg_api_id, s.tg_api_hash, proxy=s.telethon_proxy)
     if "--qr" in sys.argv:
         await client.connect()
         if not await client.is_user_authorized():

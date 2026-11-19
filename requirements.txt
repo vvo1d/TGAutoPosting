@@ -13,3 +13,6 @@ pillow>=13
 openai>=1.0
 qrcode>=7
 hachoir>=3
+aiohttp-socks>=0.10
+python-socks[asyncio]>=2.5
+socksio>=1.0

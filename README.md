@@ -84,3 +84,23 @@ python -m app.main
 | [app/links.py](app/links.py) | раскрытие ссылок, чистые ссылки на товары, партнёрские шаблоны |
 | [app/scheduler_tg.py](app/scheduler_tg.py) | «Отложенные» канала через аккаунт-читатель |
 | [app/rules.py](app/rules.py) | разбор рецепта без нейросети, фильтр рекламы |
+
+## Деплой на сервер
+
+Приложение ставится как отдельная служба systemd `tgautoposting`. У неё свой пользователь и своя папка `/opt/tgautoposting`, портов она не открывает. Сайт, nginx и другие приложения на сервере не затрагиваются. Ограничения службы: 700 МБ памяти, 80% одного ядра.
+
+1. **Перенос данных с Mac** (база, сессия аккаунта-читателя, медиа). **Сначала остановите бота на Mac**: одну и ту же сессию Telegram нельзя запускать в двух местах одновременно, иначе Telegram её сбросит.
+   ```bash
+   ssh user@server 'mkdir -p /tmp/tgap'
+   scp -r data .env deploy/install.sh user@server:/tmp/tgap/
+   ```
+2. **Установка на сервере:**
+   ```bash
+   sudo IMPORT_DIR=/tmp/tgap bash /tmp/tgap/install.sh
+   ```
+   Скрипт создаст deploy-ключ и попросит добавить его в GitHub: репозиторий → Settings → Deploy keys, только чтение. Затем он склонирует код, поставит зависимости, перенесёт данные и запустит службу. Без `IMPORT_DIR` придётся заполнить `.env` и войти аккаунтом-читателем заново (`scripts.login --qr`).
+3. **Если Telegram в РФ недоступен**, пропишите в `/opt/tgautoposting/.env` прокси: `TG_PROXY=socks5://127.0.0.1:1080` (или `http://127.0.0.1:8118`). Через него ходят только бот, аккаунт-читатель и telegra.ph. Затем перезапустите: `sudo systemctl restart tgautoposting`.
+4. После удаления `/tmp/tgap` в нём не остаётся секретов: `rm -rf /tmp/tgap`.
+
+**Управление через бота:** `/server` (версия, диск, прокси), `/logs [N]` (последние строки лога), `/update` (git pull, зависимости, перезапуск), `/restart`.
+**На сервере:** `journalctl -u tgautoposting -f`, `sudo systemctl restart|stop tgautoposting`, повторный запуск `install.sh` обновляет установку.
