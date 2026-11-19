@@ -85,16 +85,13 @@ fi
 say "Доступ к Telegram из этого сервера"
 if curl -s -o /dev/null --max-time 10 https://api.telegram.org; then
   echo "api.telegram.org доступен напрямую."
+elif ss -ltn 2>/dev/null | grep -qE '127\.0\.0\.1:(1080|8118)'; then
+  echo "Напрямую Telegram недоступен, но есть локальный прокси (Xray) — приложение возьмёт его само (TG_PROXY=auto)."
 else
-  echo "!! api.telegram.org напрямую НЕ доступен."
-  if ss -ltn 2>/dev/null | grep -q '127.0.0.1:1080'; then
-    echo "   Нашёл локальный SOCKS5 на 127.0.0.1:1080 — пропишите в $APP_DIR/.env:"
-    echo "   TG_PROXY=socks5://127.0.0.1:1080"
-  else
-    echo "   Поднимите локальный прокси и пропишите TG_PROXY в $APP_DIR/.env"
-  fi
+  echo "!! api.telegram.org недоступен и локального прокси на 127.0.0.1:1080/8118 нет."
+  echo "   Поднимите прокси (например, srv-tg-proxy.sh из VoidVPN) или пропишите TG_PROXY в $APP_DIR/.env"
 fi
-grep -q '^TG_PROXY=' "$APP_DIR/.env" && echo "Сейчас в .env: $(grep '^TG_PROXY=' "$APP_DIR/.env")"
+grep -q '^TG_PROXY=' "$APP_DIR/.env" && echo "В .env: $(grep '^TG_PROXY=' "$APP_DIR/.env")"
 
 say "Служба systemd $APP"
 cat > "/etc/systemd/system/$APP.service" <<UNIT

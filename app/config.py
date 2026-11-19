@@ -19,8 +19,17 @@ class Settings(BaseSettings):
     tg_api_id: int
     tg_api_hash: str
     # Прокси только для Telegram (бот, аккаунт-читатель, telegra.ph). Остальное — напрямую.
-    # Например: socks5://127.0.0.1:1080 или http://127.0.0.1:8118. Пусто — без прокси.
-    tg_proxy: str | None = None
+    # auto (по умолчанию) — если на этой машине слушает локальный прокси (SOCKS5 127.0.0.1:1080 или
+    # HTTP 127.0.0.1:8118, как у Xray на сервере), Telegram идёт через него, иначе напрямую.
+    # Можно задать явно: socks5://127.0.0.1:1080, http://127.0.0.1:8118; none — всегда напрямую.
+    tg_proxy: str | None = "auto"
+
+    def model_post_init(self, _ctx) -> None:
+        value = (self.tg_proxy or "").strip().lower()
+        if value in ("", "none", "off", "direct"):
+            self.tg_proxy = None
+        elif value == "auto":
+            self.tg_proxy = _detect_local_proxy()
     admin_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
 
     # Обработка текста: "openai" — любой OpenAI-совместимый API (OVH, Groq, OpenRouter, SambaNova…);
@@ -74,6 +83,22 @@ class Settings(BaseSettings):
     @property
     def session_path(self) -> Path:
         return self.data_dir / "reader"  # Telethon добавит .session
+
+
+AUTO_PROXIES = (("127.0.0.1", 1080, "socks5"), ("127.0.0.1", 8118, "http"))
+
+
+def _detect_local_proxy() -> str | None:
+    """Ищет локальный прокси к Telegram (Xray из srv-tg-proxy.sh слушает 1080/8118 только на 127.0.0.1)."""
+    import socket
+
+    for host, port, scheme in AUTO_PROXIES:
+        try:
+            with socket.create_connection((host, port), timeout=0.3):
+                return f"{scheme}://{host}:{port}"
+        except OSError:
+            continue
+    return None
 
 
 class TelegramSource(BaseModel):
