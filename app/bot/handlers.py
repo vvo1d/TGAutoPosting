@@ -433,7 +433,11 @@ async def _channel_page(pipeline: Pipeline, key: str) -> tuple[str, object]:
 
 def _plan_text(pl: dict) -> str:
     """План работы канала: сколько постов нужно на горизонт и что из этого следует для сбора."""
-    lines = [f"📋 <b>План:</b> {pl['ppd']} в день × {pl['days']} дн. = <b>{pl['target']}</b> постов вперёд",
+    lines = [f"📋 <b>План:</b> {pl['ppd']} в день × {pl['days']} дн. = "
+             + (f"{pl['ppd'] * pl['days']}, но лимит — <b>{pl['target']}</b> постов вперёд" if pl["capped"]
+                else f"<b>{pl['target']}</b> постов вперёд"),
+             f"Лимит Telegram: {pl['limit']} сообщений в отложке, у этого канала пост ≈ {pl['per_post']:g} сообщ. "
+             f"→ максимум {pl['max_posts']} постов, при {pl['ppd']} в день — на <b>{pl['max_days']} дн.</b>",
              f"Есть {pl['have']}: в отложке {pl['future']}, в очереди {pl['approved']}, на проверке {pl['pending']}"]
     if pl["need"] <= 0:
         lines.append("✅ Запас полон — сбор и обработка отдыхают")

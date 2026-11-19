@@ -24,7 +24,8 @@ CHANNEL_PARAMS: dict[str, Param] = {p.name: p for p in [
     Param("ppd", "Постов в день", 1, 48, 1,
           lambda p: p.posts_per_day or len(p.schedule) or 5),
     Param("buffer_days", "Готовить вперёд, дней", 1, 30, 1, lambda p: p.buffer_days,
-          "на сколько дней вперёд держать посты в отложке; когда запас полон — сбор и обработка не работают"),
+          "на сколько дней вперёд держать посты в отложке; потолок — лимит Telegram 100 сообщений "
+          "(альбом из N фото = N сообщений), он показан в плане; когда запас полон — сбор и обработка отдыхают"),
     Param("max_pending", "Черновиков на проверке", 1, 50, 1, lambda p: p.max_pending_drafts),
     Param("collect_min", "Сбор раз в, мин", 10, 720, 10, lambda p: p.collect_every_minutes),
     Param("per_run", "Новых за один сбор", 1, 100, 5, lambda p: 15),

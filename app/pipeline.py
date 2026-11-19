@@ -138,7 +138,11 @@ class Pipeline:
         counts = await self.db.count(p.key)
         ppd = await self.posts_per_day(p.key)
         days = await self.setting(p.key, "buffer_days")
-        target = min(ppd * days, p.max_scheduled)
+        # Лимит Telegram — 100 отложенных СООБЩЕНИЙ на чат, альбом из N фото = N сообщений.
+        # Поэтому потолок в постах = лимит / среднее число сообщений в посте этого канала.
+        per_post = await self._msgs_per_post(p.key)
+        max_posts = max(1, int(p.max_scheduled / per_post))
+        target = min(ppd * days, max_posts)
         future = await self._future_scheduled(p.key)
         have = future + counts.get("approved", 0) + counts.get("pending", 0) + counts.get("draft", 0)
         need = max(0, target - have)
@@ -146,9 +150,24 @@ class Pipeline:
         backlog = counts.get("new", 0)
         raw_needed = math.ceil(need / yield_rate) if need else 0
         return {"ppd": ppd, "days": days, "target": target, "future": future,
+                "per_post": per_post, "max_posts": max_posts, "max_days": max(1, max_posts // ppd),
+                "limit": p.max_scheduled, "capped": ppd * days > max_posts,
                 "approved": counts.get("approved", 0), "pending": counts.get("pending", 0),
                 "have": have, "need": need, "yield": yield_rate, "yield_sample": sample,
                 "backlog": backlog, "raw_needed": raw_needed, "collect": max(0, raw_needed - backlog)}
+
+    async def _msgs_per_post(self, key: str) -> float:
+        """Среднее число сообщений Telegram на пост (фото/видео в альбоме, максимум 10) по последним 100 постам."""
+        cur = await self.db.conn.execute(
+            """SELECT media, tg_msg_ids FROM items WHERE channel=?
+                 AND status IN ('new','draft','pending','approved','scheduled','published')
+               ORDER BY id DESC LIMIT 100""", (key,))
+        sizes = []
+        for media, ids in await cur.fetchall():
+            n = len(json.loads(ids)) if ids and ids != "[]" else min(len(json.loads(media or "[]")), 10)
+            if n:
+                sizes.append(n)
+        return round(sum(sizes) / len(sizes), 2) if len(sizes) >= 5 else 1.0
 
     async def _yield_rate(self, key: str) -> tuple[float, int]:
         """Доля обработанных материалов, которые стали постами (по последним 300). Не обработанное
