@@ -85,7 +85,8 @@ class Settings(BaseSettings):
         return self.data_dir / "reader"  # Telethon добавит .session
 
 
-AUTO_PROXIES = (("127.0.0.1", 1080, "socks5"), ("127.0.0.1", 8118, "http"))
+# Сначала — собственный прокси приложения (deploy/proxy.sh), затем общий Xray из srv-tg-proxy.sh
+AUTO_PROXIES = (("127.0.0.1", 10808, "socks5"), ("127.0.0.1", 1080, "socks5"), ("127.0.0.1", 8118, "http"))
 
 
 def _detect_local_proxy() -> str | None:

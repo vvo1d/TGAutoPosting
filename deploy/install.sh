@@ -93,11 +93,11 @@ fi
 say "Доступ к Telegram из этого сервера"
 if curl -s -o /dev/null --max-time 10 https://api.telegram.org; then
   echo "api.telegram.org доступен напрямую."
-elif ss -ltn 2>/dev/null | grep -qE '127\.0\.0\.1:(1080|8118)'; then
+elif ss -ltn 2>/dev/null | grep -qE '127\.0\.0\.1:(10808|1080|8118)'; then
   echo "Напрямую Telegram недоступен, но есть локальный прокси (Xray) — приложение возьмёт его само (TG_PROXY=auto)."
 else
   echo "!! api.telegram.org недоступен и локального прокси на 127.0.0.1:1080/8118 нет."
-  echo "   Поднимите прокси (например, srv-tg-proxy.sh из VoidVPN) или пропишите TG_PROXY в $APP_DIR/.env"
+  echo "   Поставьте прокси только для приложения: sudo bash $APP_DIR/deploy/proxy.sh /путь/к/proxy.json"
 fi
 grep -q '^TG_PROXY=' "$APP_DIR/.env" && echo "В .env: $(grep '^TG_PROXY=' "$APP_DIR/.env")"
 
@@ -105,8 +105,8 @@ say "Служба systemd $APP"
 cat > "/etc/systemd/system/$APP.service" <<UNIT
 [Unit]
 Description=AutoPostingTG — автопостинг в Telegram
-After=network-online.target
-Wants=network-online.target
+After=network-online.target $APP-proxy.service
+Wants=network-online.target $APP-proxy.service
 
 [Service]
 Type=simple

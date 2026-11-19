@@ -4,3 +4,8 @@ data/
 __pycache__/
 *.session
 *.session-journal
+
+# Конфиг прокси с ключами VPN — только локально/на сервере
+proxy.json
+proxy/
+bin/
