@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
+import json
 import re
 import random
 import logging
@@ -25,6 +26,7 @@ from app.models import RawPost
 from app.publisher import send_post
 from app.rules import AD_MARKERS
 from app.scheduler_tg import ChannelScheduler
+from app.settings_rt import CHANNEL_PARAMS, GLOBAL_PARAMS, clamp
 from app.rewriter import CAPTION_LIMIT, Rewriter, format_caption, html_escape, visible_len
 from app.sources.telegram import TelegramReader
 from app.sources.market import MarketReader
@@ -46,6 +48,8 @@ class Pipeline:
         self._sync_locks = {k: asyncio.Lock() for k in profiles}
         self.channel_scheduler = ChannelScheduler(tg.client) if tg else None
         self._limit_notified: dict[str, bool] = {}
+        self._quota_notified: set[str] = set()
+        self._budget, self._quota_left, self._video_mb = 0, 0, 0
 
     def moderation_chat(self, p: ChannelProfile) -> int:
         chat = p.moderation_chat or (self.settings.admin_ids[0] if self.settings.admin_ids else None)
@@ -76,15 +80,25 @@ class Pipeline:
 
     # ---------- настройки канала (меняются из бота, хранятся в базе) ----------
 
+    async def setting(self, scope: str, name: str) -> int:
+        """Настройка из бота (база) или значение по умолчанию. scope — ключ канала или "global"."""
+        params = GLOBAL_PARAMS if scope == "global" else CHANNEL_PARAMS
+        par = params[name]
+        v = await self.db.get_flag(f"cfg:{scope}:{name}")
+        return int(v) if v else par.default(self.profiles.get(scope))
+
+    async def set_setting(self, scope: str, name: str, value: int) -> int:
+        params = GLOBAL_PARAMS if scope == "global" else CHANNEL_PARAMS
+        value = clamp(params[name], value)
+        await self.db.set_flag(f"cfg:{scope}:{name}", str(value))
+        log.info("Настройка %s.%s = %s", scope, name, value)
+        return value
+
     async def posts_per_day(self, key: str) -> int:
-        v = await self.db.get_flag(f"cfg:{key}:ppd")
-        p = self.profiles[key]
-        return int(v) if v else (p.posts_per_day or len(p.schedule) or 5)
+        return await self.setting(key, "ppd")
 
     async def set_posts_per_day(self, key: str, n: int) -> int:
-        n = max(1, min(48, n))
-        await self.db.set_flag(f"cfg:{key}:ppd", str(n))
-        return n
+        return await self.set_setting(key, "ppd", n)
 
     async def moderation(self, key: str) -> bool:
         v = await self.db.get_flag(f"cfg:{key}:moderation")
@@ -115,6 +129,25 @@ class Pipeline:
                 log.exception("[%s] обработка упала", key)
 
     async def collect(self, p: ChannelProfile) -> int:
+        await self.expire_stale(p)
+        counts = await self.db.count(p.key)
+        max_new = await self.setting(p.key, "max_new")
+        backlog = counts.get("new", 0)
+        if backlog >= max_new:
+            log.info("[%s] очередь необработанных полная (%d/%d) — сбор пропущен", p.key, backlog, max_new)
+            return 0
+        quota = await self.setting("global", "media_mb") * 1_000_000
+        if self.media_usage() >= quota:
+            log.warning("[%s] медиа на диске больше лимита (%.0f МБ) — сбор пропущен", p.key, quota / 1e6)
+            await self._notify_once(p, "media_quota",
+                                    f"⚠️ Медиа на диске достигли лимита {quota / 1e6:.0f} МБ — сбор остановлен, пока не освободится место. "
+                                    "Увеличить лимит: /settings → Общие.")
+            return 0
+        self._quota_notified.discard("media_quota")
+        # Бюджет сбора: не больше per_run новых и не больше свободного места в очереди
+        self._budget = min(await self.setting(p.key, "per_run"), max_new - backlog)
+        self._video_mb = await self.setting(p.key, "video_mb")
+        self._quota_left = quota - self.media_usage()
         added = 0
         # Обходим источники в случайном порядке, чтобы ни один не был всегда первым
         tg_sources = random.sample(p.sources.telegram, len(p.sources.telegram))
@@ -139,18 +172,23 @@ class Pipeline:
         last_id = await self.db.get_last_id(p.key, source)
         candidates, new_last = await self.tg.fetch(src, last_id)
         added = 0
-        for c in candidates:
+        for n, c in enumerate(candidates):
+            if self._budget <= 0 or self._quota_left <= 0:
+                # Лимит сбора: остальное заберём в следующий раз — позицию двигаем только до обработанного
+                new_last = max(m.id for m in candidates[n - 1].messages) if n else last_id
+                break
             tph = next((l for l in c.links if "telegra.ph/" in l), None)
             if tph and (extra := await self.web.fetch_telegraph(tph)):
                 c.post.text = f"{c.post.text}\n\n{extra}"
             if await self.db.is_known(p.key, c.post):
                 continue
-            c.post.media = await self.tg.download(c, self._media_dir(p, c.post), p.max_video_mb)
+            c.post.media = await self.tg.download(c, self._media_dir(p, c.post), self._video_mb)
             if not c.post.media:
                 continue
             if item_id := await self.db.add_item(p.key, c.post):
                 await self.db.update(item_id, phash=dedup.media_hash(c.post.media))
                 added += 1
+                self._spend(c.post.media)
         if new_last is not None:
             await self.db.set_last_id(p.key, source, new_last)
         return added
@@ -158,6 +196,8 @@ class Pipeline:
     async def _collect_web(self, p: ChannelProfile, src) -> int:
         added = 0
         for url in await self.web.list_urls(src):
+            if self._budget <= 0 or self._quota_left <= 0:
+                break
             cur = await self.db.conn.execute("SELECT 1 FROM items WHERE channel=? AND source_ref=?", (p.key, url))
             if await cur.fetchone():
                 continue
@@ -171,17 +211,77 @@ class Pipeline:
             if post.media and (item_id := await self.db.add_item(p.key, post)):
                 await self.db.update(item_id, phash=dedup.media_hash(post.media))
                 added += 1
+                self._spend(post.media)
         return added
+
+    def _spend(self, media: list) -> None:
+        self._budget -= 1
+        self._quota_left -= sum(Path(m.path).stat().st_size for m in media if Path(m.path).exists())
+
+    # ---------- место на диске ----------
+
+    def media_usage(self) -> int:
+        root = self.settings.media_dir
+        return sum(f.stat().st_size for f in root.rglob("*") if f.is_file()) if root.exists() else 0
+
+    async def expire_stale(self, p: ChannelProfile) -> int:
+        """Необработанные дольше ttl_h — устарели: удаляем их медиа и помечаем отклонёнными."""
+        ttl = await self.setting(p.key, "ttl_h")
+        since = (datetime.now(timezone.utc) - timedelta(hours=ttl)).isoformat(timespec="seconds")
+        cur = await self.db.conn.execute(
+            "SELECT id FROM items WHERE channel=? AND status='new' AND created_at<?", (p.key, since))
+        ids = [r[0] for r in await cur.fetchall()]
+        for i in ids:
+            it = await self.db.get(i)
+            await self.db.update(i, status="rejected", note=f"устарел: не обработан за {ttl} ч")
+            self._cleanup(it)
+        if ids:
+            log.info("[%s] устарело и удалено необработанных: %d", p.key, len(ids))
+        return len(ids)
+
+    async def cleanup_media(self) -> tuple[int, int]:
+        """Удаляет папки медиа, которые не нужны ни одному живому посту. Возвращает (папок, байт)."""
+        root = self.settings.media_dir
+        if not root.exists():
+            return 0, 0
+        cur = await self.db.conn.execute(
+            "SELECT media FROM items WHERE status IN ('new','draft','pending','approved')")
+        keep = {str(Path(m["path"]).parent) for (raw,) in await cur.fetchall() for m in json.loads(raw or "[]")}
+        dirs = removed = 0
+        for ch_dir in root.iterdir():
+            if not ch_dir.is_dir():
+                continue
+            for d in ch_dir.iterdir():
+                if d.is_dir() and str(d) not in keep:
+                    removed += sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+                    shutil.rmtree(d, ignore_errors=True)
+                    dirs += 1
+        if dirs:
+            log.info("Уборка медиа: удалено папок %d, освобождено %.0f МБ", dirs, removed / 1e6)
+        return dirs, removed
+
+    async def cleanup_job(self) -> None:
+        try:
+            for p in self.profiles.values():
+                await self.expire_stale(p)
+            await self.cleanup_media()
+        except Exception:
+            log.exception("уборка медиа упала")
+
+    async def _notify_once(self, p: ChannelProfile, tag: str, text: str) -> None:
+        if tag not in self._quota_notified:
+            self._quota_notified.add(tag)
+            await self._notify(p, text)
 
     # ---------- 2. переписывание и отправка на модерацию ----------
 
     async def process(self, p: ChannelProfile) -> None:
         counts = await self.db.count(p.key)
         moderated = await self.moderation(p.key)
-        free = p.max_pending_drafts - counts.get("pending", 0)
+        free = await self.setting(p.key, "max_pending") - counts.get("pending", 0)
         if not moderated:
             # Без проверки: готовим ровно столько, чтобы хватило на buffer_days дней вперёд
-            target = await self.posts_per_day(p.key) * p.buffer_days
+            target = await self.posts_per_day(p.key) * await self.setting(p.key, "buffer_days")
             free = (target - counts.get("approved", 0) - counts.get("pending", 0)
                     - await self._future_scheduled(p.key))
         if free <= 0:

@@ -47,7 +47,7 @@ async def cmd_help(msg: Message) -> None:
         "/status — статистика и очередь\n"
         "/collect — собрать и подготовить посты сейчас\n"
         "/publish &lt;канал&gt; — опубликовать следующий из очереди\n"
-        "/channels — проверка вкл/выкл и число постов в день для каждого канала\n"
+        "/settings — все настройки каналов: проверка, постов в день, лимиты сбора и места на диске\n"
         "/pause, /resume [канал] [сбор|постинг] — пауза; без аргументов — всё. Кнопки паузы — под /status\n"
         "/server — версия, диск, прокси · /logs [N] — последние строки лога\n"
         "/update — обновить из GitHub и перезапуститься · /restart — перезапуск\n\n"
@@ -344,7 +344,7 @@ async def cmd_server(msg: Message, pipeline: Pipeline) -> None:
         f"<b>Версия:</b> {html_escape(commit.strip())}\n"
         f"<b>systemd:</b> {'да' if UNDER_SYSTEMD else 'нет (запущено вручную)'}\n"
         f"<b>Прокси Telegram:</b> {html_escape(pipeline.settings.tg_proxy or 'нет')}\n"
-        f"<b>Медиа на диске:</b> {media:.0f} МБ\n<pre>{html_escape(disk.strip())}</pre>")
+        f"<b>Медиа на диске:</b> {media:.0f} МБ (лимит {await pipeline.setting('global', 'media_mb')} МБ, /settings)\n<pre>{html_escape(disk.strip())}</pre>")
 
 
 @router.message(Command("restart"))
@@ -380,72 +380,149 @@ async def cmd_update(msg: Message) -> None:
     _restart_soon()
 
 
-# ---------- настройки каналов: проверка и постов в день ----------
+# ---------- настройки из бота: /settings (и /channels) ----------
 
-async def _channels_text(pipeline: Pipeline) -> str:
-    lines = ["<b>Каналы</b>"]
+def _mb(b: int) -> str:
+    return f"{b / 1e6:.0f} МБ" if b < 1e9 else f"{b / 1e9:.1f} ГБ"
+
+
+async def _settings_menu(pipeline: Pipeline) -> tuple[str, object]:
+    quota = await pipeline.setting("global", "media_mb") * 1_000_000
+    used = pipeline.media_usage()
+    lines = ["<b>Настройки</b>", f"Медиа на диске: {_mb(used)} из {_mb(quota)}"]
+    kb = InlineKeyboardBuilder()
     for key, p in pipeline.profiles.items():
         mod = await pipeline.moderation(key)
         ppd = await pipeline.posts_per_day(key)
-        lines.append(
-            f"\n<b>{html_escape(p.title)}</b> ({key})\n"
-            f"Проверка: {'🛡 включена — черновики приходят вам' if mod else '⚡️ выключена — сразу в отложенные'}\n"
-            f"Постов в день: <b>{ppd}</b> · окно {p.day_start}–{p.day_end}, "
-            f"примерно раз в {_fmt_interval(p, ppd)}, время случайное")
-    lines.append("\nУдалённый вручную пост из отложенных заменяется следующим из очереди (проверка раз в 5 минут).")
-    return "\n".join(lines)
+        lines.append(f"\n<b>{html_escape(p.title)}</b>: {'🛡 с проверкой' if mod else '⚡️ без проверки'}, {ppd} постов в день")
+        kb.button(text=f"⚙️ {p.title}", callback_data=f"st:ch:{key}")
+    kb.button(text="🌐 Общие (диск, уборка)", callback_data="st:gl")
+    kb.adjust(1)
+    return "\n".join(lines), kb.as_markup()
+
+
+async def _channel_page(pipeline: Pipeline, key: str) -> tuple[str, object]:
+    from app.settings_rt import CHANNEL_PARAMS
+
+    p = pipeline.profiles[key]
+    mod = await pipeline.moderation(key)
+    ppd = await pipeline.posts_per_day(key)
+    counts = await pipeline.db.count(key)
+    lines = [f"<b>⚙️ {html_escape(p.title)}</b>",
+             f"Проверка: {'🛡 включена — черновики приходят вам' if mod else '⚡️ выключена — сразу в отложенные'}",
+             f"Публикации: окно {p.day_start}–{p.day_end}, ~раз в {_fmt_interval(p, ppd)}, время случайное",
+             f"Сейчас: необработанных {counts.get('new', 0)}, на проверке {counts.get('pending', 0)}, "
+             f"в очереди {counts.get('approved', 0)}, в отложенных {counts.get('scheduled', 0)}", ""]
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🛡 Проверка: вкл" if mod else "⚡️ Проверка: выкл", callback_data=f"st:mod:{key}")
+    sizes = [1]
+    for name, par in CHANNEL_PARAMS.items():
+        v = await pipeline.setting(key, name)
+        if par.hint:
+            lines.append(f"• {par.label}: <b>{v}</b> — {par.hint}")
+        else:
+            lines.append(f"• {par.label}: <b>{v}</b>")
+        kb.button(text="−", callback_data=f"st:set:{key}:{name}:-{par.step}")
+        kb.button(text=f"{par.label}: {v}", callback_data=f"st:info:{key}:{name}")
+        kb.button(text="+", callback_data=f"st:set:{key}:{name}:{par.step}")
+        sizes.append(3)
+    kb.button(text="◀️ Назад", callback_data="st:menu")
+    sizes.append(1)
+    kb.adjust(*sizes)
+    return "\n".join(lines), kb.as_markup()
+
+
+async def _global_page(pipeline: Pipeline, note: str = "") -> tuple[str, object]:
+    from app.settings_rt import GLOBAL_PARAMS
+
+    used = pipeline.media_usage()
+    lines = ["<b>🌐 Общие настройки</b>", f"Медиа на диске сейчас: {_mb(used)}", ""]
+    kb = InlineKeyboardBuilder()
+    sizes = []
+    for name, par in GLOBAL_PARAMS.items():
+        v = await pipeline.setting("global", name)
+        lines.append(f"• {par.label}: <b>{v}</b>" + (f" — {par.hint}" if par.hint else ""))
+        kb.button(text="−", callback_data=f"st:set:global:{name}:-{par.step}")
+        kb.button(text=f"{par.label}: {v}", callback_data=f"st:info:global:{name}")
+        kb.button(text="+", callback_data=f"st:set:global:{name}:{par.step}")
+        sizes.append(3)
+    lines.append("\nУборка идёт сама раз в час: устаревшие необработанные посты и файлы, которые больше не нужны.")
+    if note:
+        lines.append(f"\n{note}")
+    kb.button(text="🧹 Убрать сейчас", callback_data="st:clean")
+    kb.button(text="◀️ Назад", callback_data="st:menu")
+    sizes += [1, 1]
+    kb.adjust(*sizes)
+    return "\n".join(lines), kb.as_markup()
 
 
 def _fmt_interval(p, ppd: int) -> str:
-    from app.pipeline import day_intervals
     from datetime import date
+    from app.pipeline import day_intervals
+
     a, b = day_intervals(p, date.today(), ppd)[0]
     mins = int((b - a).total_seconds() // 60)
     return f"{mins // 60} ч {mins % 60:02d} мин" if mins >= 60 else f"{mins} мин"
 
 
-async def _channels_kb(pipeline: Pipeline):
-    kb = InlineKeyboardBuilder()
-    sizes = []
-    for key, p in pipeline.profiles.items():
-        mod = await pipeline.moderation(key)
-        kb.button(text=f"{'🛡 Проверка: вкл' if mod else '⚡️ Проверка: выкл'} · {p.title}", callback_data=f"chan:{key}:mod")
-        ppd = await pipeline.posts_per_day(key)
-        kb.button(text="−", callback_data=f"chan:{key}:ppd:-1")
-        kb.button(text=f"{ppd} в день", callback_data=f"chan:{key}:noop")
-        kb.button(text="+", callback_data=f"chan:{key}:ppd:1")
-        sizes += [1, 3]
-    kb.adjust(*sizes)
-    return kb.as_markup()
+@router.message(Command("settings", "channels"))
+async def cmd_settings(msg: Message, pipeline: Pipeline) -> None:
+    text, kb = await _settings_menu(pipeline)
+    await msg.answer(text, reply_markup=kb)
 
 
-@router.message(Command("channels"))
-async def cmd_channels(msg: Message, pipeline: Pipeline) -> None:
-    await msg.answer(await _channels_text(pipeline), reply_markup=await _channels_kb(pipeline))
+@router.callback_query(F.data.startswith("st:"))
+async def on_settings(cb: CallbackQuery, pipeline: Pipeline, scheduler) -> None:
+    from app.settings_rt import CHANNEL_PARAMS, GLOBAL_PARAMS
 
-
-@router.callback_query(F.data.startswith("chan:"))
-async def on_channel_setting(cb: CallbackQuery, pipeline: Pipeline) -> None:
     parts = cb.data.split(":")
-    key, action = parts[1], parts[2]
-    if key not in pipeline.profiles:
-        await cb.answer("Неизвестный канал", show_alert=True)
-        return
-    p = pipeline.profiles[key]
-    if action == "noop":
-        await cb.answer("Кнопками − и + меняется число постов в день. Точное значение: /ppd канал число")
-        return
-    if action == "mod":
+    action = parts[1]
+    page = None
+    if action == "menu":
+        page = await _settings_menu(pipeline)
+    elif action == "ch" and parts[2] in pipeline.profiles:
+        page = await _channel_page(pipeline, parts[2])
+    elif action == "gl":
+        page = await _global_page(pipeline)
+    elif action == "mod" and parts[2] in pipeline.profiles:
+        key = parts[2]
         on = not await pipeline.moderation(key)
         await pipeline.set_moderation(key, on)
-        await cb.answer(f"{p.title}: проверка {'включена' if on else 'выключена'}")
+        await cb.answer(f"Проверка {'включена' if on else 'выключена'}")
         if not on:
             asyncio.create_task(pipeline.process_job(key))
-    elif action == "ppd":
-        n = await pipeline.set_posts_per_day(key, await pipeline.posts_per_day(key) + int(parts[3]))
-        await cb.answer(f"{p.title}: {n} постов в день")
-        asyncio.create_task(pipeline.sync_job(key))
-    await cb.message.edit_text(await _channels_text(pipeline), reply_markup=await _channels_kb(pipeline))
+        page = await _channel_page(pipeline, key)
+    elif action == "info":
+        par = (GLOBAL_PARAMS if parts[2] == "global" else CHANNEL_PARAMS)[parts[3]]
+        await cb.answer(f"{par.label}: от {par.lo} до {par.hi}. {par.hint}".strip(), show_alert=True)
+        return
+    elif action == "set":
+        scope, name, delta = parts[2], parts[3], int(parts[4])
+        if scope != "global" and scope not in pipeline.profiles:
+            await cb.answer("Неизвестный канал", show_alert=True)
+            return
+        v = await pipeline.set_setting(scope, name, await pipeline.setting(scope, name) + delta)
+        await cb.answer(f"= {v}")
+        if name == "collect_min" and scheduler.get_job(f"collect:{scope}"):
+            scheduler.reschedule_job(f"collect:{scope}", trigger="interval", minutes=v)
+        if name in ("ppd", "buffer_days", "max_pending"):
+            asyncio.create_task(pipeline.process_job(scope))
+            asyncio.create_task(pipeline.sync_job(scope))
+        page = await (_global_page(pipeline) if scope == "global" else _channel_page(pipeline, scope))
+    elif action == "clean":
+        await cb.answer("Убираю…")
+        expired = 0
+        for p in pipeline.profiles.values():
+            expired += await pipeline.expire_stale(p)
+        dirs, freed = await pipeline.cleanup_media()
+        page = await _global_page(pipeline, f"🧹 Удалено устаревших постов: {expired}, папок медиа: {dirs}, освобождено {_mb(freed)}")
+    if page:
+        if action not in ("mod", "set", "clean"):
+            await cb.answer()
+        try:
+            await cb.message.edit_text(page[0], reply_markup=page[1])
+        except Exception:
+            pass  # «message is not modified» — значение упёрлось в границу
 
 
 @router.message(Command("ppd"))
@@ -456,5 +533,5 @@ async def cmd_ppd(msg: Message, command: CommandObject, pipeline: Pipeline) -> N
         return
     n = await pipeline.set_posts_per_day(args[0], int(args[1]))
     asyncio.create_task(pipeline.sync_job(args[0]))
-    await msg.answer(f"Готово: {n} постов в день.\n\n" + await _channels_text(pipeline),
-                     reply_markup=await _channels_kb(pipeline))
+    text, kb = await _channel_page(pipeline, args[0])
+    await msg.answer(f"Готово: {n} постов в день.\n\n{text}", reply_markup=kb)

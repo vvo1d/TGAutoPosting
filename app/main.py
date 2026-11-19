@@ -56,7 +56,8 @@ async def main() -> None:
     start = datetime.now() + timedelta(seconds=10)
     for key, p in profiles.items():
         scheduler.add_job(pipeline.collect_job, "interval", args=[key], id=f"collect:{key}",
-                          minutes=p.collect_every_minutes, next_run_time=start, max_instances=1, coalesce=True)
+                          minutes=await pipeline.setting(key, "collect_min"), next_run_time=start,
+                          max_instances=1, coalesce=True)
         # Обработка «новых» материалов каждую минуту — не ждём окончания сбора
         scheduler.add_job(pipeline.process_job, "interval", args=[key], id=f"process:{key}",
                           minutes=1, next_run_time=start + timedelta(seconds=20), max_instances=1, coalesce=True)
@@ -71,6 +72,9 @@ async def main() -> None:
             scheduler.add_job(pipeline.publish_next, OrTrigger(slots), args=[key], id=f"publish:{key}",
                               max_instances=1, coalesce=True, misfire_grace_time=600)
         log.info("Канал %s → %s, слоты: %s", p.title, p.target, ", ".join(p.schedule))
+    # Уборка: устаревшие необработанные посты и ненужные медиа — при старте и раз в час
+    scheduler.add_job(pipeline.cleanup_job, "interval", id="cleanup", hours=1,
+                      next_run_time=start + timedelta(seconds=2), max_instances=1, coalesce=True)
     scheduler.start()
 
     dp = Dispatcher()
@@ -81,7 +85,7 @@ async def main() -> None:
         BotCommand(command="status", description="Статистика и очередь"),
         BotCommand(command="collect", description="Собрать посты сейчас"),
         BotCommand(command="publish", description="Опубликовать следующий из очереди"),
-        BotCommand(command="channels", description="Проверка вкл/выкл, постов в день"),
+        BotCommand(command="settings", description="Настройки каналов, лимиты, диск"),
         BotCommand(command="pause", description="Пауза сбора/постинга (кнопки — в /status)"),
         BotCommand(command="resume", description="Снять паузу"),
         BotCommand(command="server", description="Версия, диск, прокси"),
