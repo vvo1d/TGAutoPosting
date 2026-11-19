@@ -64,7 +64,19 @@ class Pipeline:
         await self.collect_job(key)
         await self.process_job(key)
 
+    # ---------- пауза ----------
+    # collect — сбор из источников и подготовка черновиков; post — постановка в отложенные / публикация
+
+    async def is_paused(self, key: str, what: str) -> bool:
+        return await self.db.get_flag(f"pause:{key}:{what}") == "1"
+
+    async def set_paused(self, key: str, what: str, paused: bool) -> None:
+        await self.db.set_flag(f"pause:{key}:{what}", "1" if paused else None)
+        log.info("[%s] %s: %s", key, what, "пауза" if paused else "возобновлено")
+
     async def collect_job(self, key: str) -> None:
+        if await self.is_paused(key, "collect"):
+            return
         if self._collect_locks[key].locked():
             log.info("[%s] сбор уже идёт", key)
             return
@@ -75,7 +87,7 @@ class Pipeline:
                 log.exception("[%s] сбор упал", key)
 
     async def process_job(self, key: str) -> None:
-        if self._process_locks[key].locked():
+        if await self.is_paused(key, "collect") or self._process_locks[key].locked():
             return
         async with self._process_locks[key]:
             try:
@@ -377,6 +389,9 @@ class Pipeline:
     # ---------- 3. публикация ----------
 
     async def publish_next(self, key: str) -> None:
+        if await self.is_paused(key, "post"):
+            log.info("[%s] постинг на паузе — слот пропущен", key)
+            return
         p = self.profiles[key]
         items = await self.db.by_status(key, "approved", limit=1, order="approved_at, id")
         if not items:
@@ -406,7 +421,7 @@ class Pipeline:
         return p.publish_mode == "scheduled" and self.channel_scheduler is not None
 
     async def sync_job(self, key: str) -> None:
-        if self._sync_locks[key].locked():
+        if await self.is_paused(key, "post") or self._sync_locks[key].locked():
             return
         async with self._sync_locks[key]:
             try:

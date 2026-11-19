@@ -40,6 +40,11 @@ CREATE TABLE IF NOT EXISTS items (
 CREATE INDEX IF NOT EXISTS ix_items_status ON items (channel, status);
 CREATE INDEX IF NOT EXISTS ix_items_hash ON items (channel, text_hash);
 
+CREATE TABLE IF NOT EXISTS flags (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS source_state (
     channel TEXT NOT NULL,
     source  TEXT NOT NULL,
@@ -145,6 +150,21 @@ class DB:
             (channel, item_id, since, item_id),
         )
         return [dict(r) for r in await cur.fetchall()]
+
+    # ---------- флаги (пауза и т.п.) ----------
+
+    async def get_flag(self, key: str) -> str | None:
+        cur = await self.conn.execute("SELECT value FROM flags WHERE key=?", (key,))
+        row = await cur.fetchone()
+        return row["value"] if row else None
+
+    async def set_flag(self, key: str, value: str | None) -> None:
+        if value is None:
+            await self.conn.execute("DELETE FROM flags WHERE key=?", (key,))
+        else:
+            await self.conn.execute("INSERT INTO flags (key, value) VALUES (?, ?) "
+                                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        await self.conn.commit()
 
     # ---------- source state ----------
 

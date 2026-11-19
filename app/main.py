@@ -80,6 +80,8 @@ async def main() -> None:
         BotCommand(command="status", description="Статистика и очередь"),
         BotCommand(command="collect", description="Собрать посты сейчас"),
         BotCommand(command="publish", description="Опубликовать следующий из очереди"),
+        BotCommand(command="pause", description="Пауза сбора/постинга (кнопки — в /status)"),
+        BotCommand(command="resume", description="Снять паузу"),
         BotCommand(command="server", description="Версия, диск, прокси"),
         BotCommand(command="logs", description="Последние строки лога"),
         BotCommand(command="update", description="Обновить из GitHub и перезапуститься"),

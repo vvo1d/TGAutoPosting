@@ -11,6 +11,7 @@ from pathlib import Path
 from aiogram import F, Router
 from aiogram.filters import BaseFilter, Command, CommandObject
 from aiogram.types import CallbackQuery, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.pipeline import Pipeline, _control_text, moderation_kb
 from app.rewriter import html_escape
@@ -46,6 +47,7 @@ async def cmd_help(msg: Message) -> None:
         "/status — статистика и очередь\n"
         "/collect — собрать и подготовить посты сейчас\n"
         "/publish &lt;канал&gt; — опубликовать следующий из очереди\n"
+        "/pause, /resume [канал] [сбор|постинг] — пауза; без аргументов — всё. Кнопки паузы — под /status\n"
         "/server — версия, диск, прокси · /logs [N] — последние строки лога\n"
         "/update — обновить из GitHub и перезапуститься · /restart — перезапуск\n\n"
         "Черновики приходят сюда с кнопками. В режиме «✏️ Изменить» пришлите новый текст поста "
@@ -53,28 +55,94 @@ async def cmd_help(msg: Message) -> None:
     )
 
 
-@router.message(Command("status"))
-async def cmd_status(msg: Message, pipeline: Pipeline, scheduler) -> None:
+WHAT_RU = {"collect": "Сбор", "post": "Постинг"}
+
+
+async def _status_text(pipeline: Pipeline, scheduler) -> str:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
     lines = []
     for key, p in pipeline.profiles.items():
         counts = await pipeline.db.count(key)
         stats = ", ".join(f"{STATUS_RU.get(s, s)}: {c}" for s, c in sorted(counts.items())) or "пусто"
         if pipeline.uses_scheduled(p):
             sch = await pipeline.db.by_status(key, "scheduled", limit=1000, order="scheduled_at")
-            nxt = sch[0]["scheduled_at"] if sch else None
-            if nxt:
-                from datetime import datetime
-                from zoneinfo import ZoneInfo
-                nxt = datetime.fromisoformat(nxt).astimezone(ZoneInfo(p.timezone)).strftime("%d.%m %H:%M")
-            last = sch[-1]["scheduled_at"] if sch else None
-            info = f"В отложенных: {len(sch)}" + (f", ближайший {nxt}" if nxt else "")
-            if last:
-                info += f", расписано до {datetime.fromisoformat(last).astimezone(ZoneInfo(p.timezone)):%d.%m}"
+            tz = ZoneInfo(p.timezone)
+            info = f"В отложенных: {len(sch)}"
+            if sch:
+                info += (f", ближайший {datetime.fromisoformat(sch[0]['scheduled_at']).astimezone(tz):%d.%m %H:%M}"
+                         f", расписано до {datetime.fromisoformat(sch[-1]['scheduled_at']).astimezone(tz):%d.%m}")
         else:
             job = scheduler.get_job(f"publish:{key}")
             info = "Следующая публикация: " + (job.next_run_time.strftime("%d.%m %H:%M") if job and job.next_run_time else "—")
-        lines.append(f"<b>{html_escape(p.title)}</b> ({key})\n{stats}\n{info}")
-    await msg.answer("\n\n".join(lines), parse_mode="HTML")
+        parts = []
+        for w in ("collect", "post"):
+            parts.append(f"{WHAT_RU[w]}: {'⏸ пауза' if await pipeline.is_paused(key, w) else '▶️ работает'}")
+        state = " · ".join(parts)
+        lines.append(f"<b>{html_escape(p.title)}</b> ({key})\n{state}\n{stats}\n{info}")
+    return "\n\n".join(lines)
+
+
+async def _status_kb(pipeline: Pipeline):
+    kb = InlineKeyboardBuilder()
+    for key, p in pipeline.profiles.items():
+        for w in ("collect", "post"):
+            paused = await pipeline.is_paused(key, w)
+            kb.button(text=f"{'▶️' if paused else '⏸'} {WHAT_RU[w]} · {p.title}",
+                      callback_data=f"ctl:{key}:{w}:{'on' if paused else 'off'}")
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+@router.message(Command("status"))
+async def cmd_status(msg: Message, pipeline: Pipeline, scheduler) -> None:
+    await msg.answer(await _status_text(pipeline, scheduler), reply_markup=await _status_kb(pipeline))
+
+
+@router.callback_query(F.data.startswith("ctl:"))
+async def on_control(cb: CallbackQuery, pipeline: Pipeline, scheduler) -> None:
+    _, key, what, mode = cb.data.split(":")
+    if key not in pipeline.profiles or what not in WHAT_RU:
+        await cb.answer("Неизвестный канал", show_alert=True)
+        return
+    await pipeline.set_paused(key, what, mode == "off")
+    p = pipeline.profiles[key]
+    await cb.answer(f"{WHAT_RU[what]} · {p.title}: {'пауза' if mode == 'off' else 'возобновлён'}")
+    if mode == "on" and what == "post" and pipeline.uses_scheduled(p):
+        asyncio.create_task(pipeline.sync_job(key))  # сразу разложить накопившуюся очередь
+    await cb.message.edit_text(await _status_text(pipeline, scheduler), reply_markup=await _status_kb(pipeline))
+
+
+def _parse_pause_args(args: str | None, pipeline: Pipeline) -> tuple[list[str], list[str]] | str:
+    """/pause [канал] [сбор|постинг] -> (каналы, что). Без аргументов — все каналы, всё."""
+    keys, whats = [], []
+    for a in (args or "").lower().split():
+        if a in pipeline.profiles:
+            keys.append(a)
+        elif a.startswith("сбор") or a == "collect":
+            whats.append("collect")
+        elif a.startswith("пост") or a == "post":
+            whats.append("post")
+        else:
+            return f"Не понял «{html_escape(a)}». Каналы: {', '.join(pipeline.profiles)}; что: сбор, постинг."
+    return keys or list(pipeline.profiles), whats or ["collect", "post"]
+
+
+@router.message(Command("pause", "resume"))
+async def cmd_pause(msg: Message, command: CommandObject, pipeline: Pipeline, scheduler) -> None:
+    parsed = _parse_pause_args(command.args, pipeline)
+    if isinstance(parsed, str):
+        await msg.answer(parsed)
+        return
+    keys, whats = parsed
+    paused = command.command == "pause"
+    for k in keys:
+        for w in whats:
+            await pipeline.set_paused(k, w, paused)
+        if not paused and "post" in whats and pipeline.uses_scheduled(pipeline.profiles[k]):
+            asyncio.create_task(pipeline.sync_job(k))
+    await msg.answer(await _status_text(pipeline, scheduler), reply_markup=await _status_kb(pipeline))
 
 
 @router.message(Command("collect"))
@@ -224,6 +292,8 @@ async def on_market_links(msg: Message, pipeline: Pipeline) -> None:
             lines.append("\nЧерновики придут по мере обработки — ваши товары идут первыми, ссылки остаются ваши.")
         await msg.answer("\n".join(lines))
         if rep["added"]:
+            if await pipeline.is_paused(profile.key, "collect"):
+                await msg.answer("⏸ Сбор на паузе — черновики по этим товарам придут после /resume.")
             await pipeline.process_job(profile.key)
 
     asyncio.create_task(run())
