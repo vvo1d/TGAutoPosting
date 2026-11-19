@@ -171,7 +171,7 @@ class ChannelProfile(BaseModel):
     day_start: str = "08:00"
     day_end: str = "23:00"
     moderation: bool = True           # True — черновики на проверку; False — сразу в отложенные
-    buffer_days: int = 2              # без проверки: готовим посты на столько дней вперёд
+    buffer_days: int = 3              # на сколько дней вперёд держать посты (сбор и обработка — по потребности)
     max_scheduled: int = 100          # лимит Telegram на отложенные сообщения в чате
     min_lead_minutes: int = 15        # ближайший слот — не раньше чем через N минут
     collect_every_minutes: int = 30

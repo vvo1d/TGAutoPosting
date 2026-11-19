@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import html
 import json
+import math
 import re
 import random
 import logging
@@ -128,11 +129,54 @@ class Pipeline:
             except Exception:
                 log.exception("[%s] обработка упала", key)
 
+    # ---------- план: сколько постов нужно и сколько для этого собрать ----------
+
+    async def plan(self, p: ChannelProfile) -> dict:
+        """Работаем от потребности: цель = постов в день × дней вперёд (не больше лимита отложенных).
+        Не хватает = цель − (в отложке впереди + в очереди + на проверке). Чтобы получить столько годных,
+        с учётом выхода годных (доля обработанных, дошедших до поста) нужно ~не хватает / выход сырых."""
+        counts = await self.db.count(p.key)
+        ppd = await self.posts_per_day(p.key)
+        days = await self.setting(p.key, "buffer_days")
+        target = min(ppd * days, p.max_scheduled)
+        future = await self._future_scheduled(p.key)
+        have = future + counts.get("approved", 0) + counts.get("pending", 0) + counts.get("draft", 0)
+        need = max(0, target - have)
+        yield_rate, sample = await self._yield_rate(p.key)
+        backlog = counts.get("new", 0)
+        raw_needed = math.ceil(need / yield_rate) if need else 0
+        return {"ppd": ppd, "days": days, "target": target, "future": future,
+                "approved": counts.get("approved", 0), "pending": counts.get("pending", 0),
+                "have": have, "need": need, "yield": yield_rate, "yield_sample": sample,
+                "backlog": backlog, "raw_needed": raw_needed, "collect": max(0, raw_needed - backlog)}
+
+    async def _yield_rate(self, key: str) -> tuple[float, int]:
+        """Доля обработанных материалов, которые стали постами (по последним 300). Не обработанное
+        по нашей причине (устарело, перенос, отключённый источник) не учитывается."""
+        cur = await self.db.conn.execute(
+            """SELECT status FROM items WHERE channel=? AND status NOT IN ('new','failed')
+                 AND (note IS NULL OR (note NOT LIKE 'устарел%' AND note NOT LIKE 'не перенесён%'
+                      AND note NOT LIKE 'источник отключён%'))
+               ORDER BY id DESC LIMIT 300""", (key,))
+        rows = [r[0] for r in await cur.fetchall()]
+        if len(rows) < 10:
+            return 0.5, len(rows)  # истории мало — считаем, что годен каждый второй
+        good = sum(r in ("draft", "pending", "approved", "scheduled", "published") for r in rows)
+        return max(0.1, min(1.0, good / len(rows))), len(rows)
+
     async def collect(self, p: ChannelProfile) -> int:
         await self.expire_stale(p)
-        counts = await self.db.count(p.key)
+        plan = await self.plan(p)
+        if plan["need"] <= 0:
+            log.info("[%s] запас полон (%d/%d постов на %d дн.) — сбор не нужен",
+                     p.key, plan["have"], plan["target"], plan["days"])
+            return 0
+        if plan["collect"] <= 0:
+            log.info("[%s] не хватает %d постов, необработанных уже %d (нужно ~%d) — сбор не нужен",
+                     p.key, plan["need"], plan["backlog"], plan["raw_needed"])
+            return 0
         max_new = await self.setting(p.key, "max_new")
-        backlog = counts.get("new", 0)
+        backlog = plan["backlog"]
         if backlog >= max_new:
             log.info("[%s] очередь необработанных полная (%d/%d) — сбор пропущен", p.key, backlog, max_new)
             return 0
@@ -144,8 +188,10 @@ class Pipeline:
                                     "Увеличить лимит: /settings → Общие.")
             return 0
         self._quota_notified.discard("media_quota")
-        # Бюджет сбора: не больше per_run новых и не больше свободного места в очереди
-        self._budget = min(await self.setting(p.key, "per_run"), max_new - backlog)
+        # Бюджет сбора: сколько нужно по плану, но не больше per_run и свободного места в очереди
+        self._budget = min(plan["collect"], await self.setting(p.key, "per_run"), max_new - backlog)
+        log.info("[%s] не хватает %d постов (выход годных %.0f%%) — собираю до %d материалов",
+                 p.key, plan["need"], plan["yield"] * 100, self._budget)
         self._video_mb = await self.setting(p.key, "video_mb")
         self._quota_left = quota - self.media_usage()
         added = 0
@@ -276,27 +322,31 @@ class Pipeline:
     # ---------- 2. переписывание и отправка на модерацию ----------
 
     async def process(self, p: ChannelProfile) -> None:
-        counts = await self.db.count(p.key)
         moderated = await self.moderation(p.key)
-        free = await self.setting(p.key, "max_pending") - counts.get("pending", 0)
-        if not moderated:
-            # Без проверки: готовим ровно столько, чтобы хватило на buffer_days дней вперёд
-            target = await self.posts_per_day(p.key) * await self.setting(p.key, "buffer_days")
-            free = (target - counts.get("approved", 0) - counts.get("pending", 0)
-                    - await self._future_scheduled(p.key))
-        if free <= 0:
+        plan = await self.plan(p)
+        # Сколько годных постов сделать в этот раз: сколько не хватает до запаса,
+        # а с проверкой — ещё и не больше свободных мест на проверке
+        want = plan["need"]
+        if moderated:
+            want = min(want, await self.setting(p.key, "max_pending") - plan["pending"])
+        if want <= 0 or not plan["backlog"]:
             return
         new_items = await self.db.by_status(p.key, "new", limit=1000)
         for it in new_items:  # досчитываем хэши картинок (для материалов, собранных до появления проверки)
             if not it.get("phash") and (h := dedup.media_hash(it["media"])):
                 it["phash"] = h
                 await self.db.update(it["id"], phash=h)
-        items = self._mix_sources(new_items)[:free]
-        auto_added = 0
+        items = self._mix_sources(new_items)
+        auto_added = made = 0
+        attempts_left = max(5, want * 3)  # за один проход не тратим на модель больше, чем нужно с запасом
         for item in items:
+            if made >= want or attempts_left <= 0:
+                break
+            attempts_left -= 1
             try:
                 ok = await self._rewrite_item(p, item)
                 if ok:
+                    made += 1
                     draft = await self.db.get(item["id"])
                     if moderated or deals.CRITICAL in (draft["note"] or ""):  # битая ссылка и т.п. — всегда на проверку
                         await self.send_draft(p, draft)

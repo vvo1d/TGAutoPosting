@@ -411,8 +411,7 @@ async def _channel_page(pipeline: Pipeline, key: str) -> tuple[str, object]:
     lines = [f"<b>⚙️ {html_escape(p.title)}</b>",
              f"Проверка: {'🛡 включена — черновики приходят вам' if mod else '⚡️ выключена — сразу в отложенные'}",
              f"Публикации: окно {p.day_start}–{p.day_end}, ~раз в {_fmt_interval(p, ppd)}, время случайное",
-             f"Сейчас: необработанных {counts.get('new', 0)}, на проверке {counts.get('pending', 0)}, "
-             f"в очереди {counts.get('approved', 0)}, в отложенных {counts.get('scheduled', 0)}", ""]
+             _plan_text(await pipeline.plan(p)), ""]
     kb = InlineKeyboardBuilder()
     kb.button(text="🛡 Проверка: вкл" if mod else "⚡️ Проверка: выкл", callback_data=f"st:mod:{key}")
     sizes = [1]
@@ -430,6 +429,20 @@ async def _channel_page(pipeline: Pipeline, key: str) -> tuple[str, object]:
     sizes.append(1)
     kb.adjust(*sizes)
     return "\n".join(lines), kb.as_markup()
+
+
+def _plan_text(pl: dict) -> str:
+    """План работы канала: сколько постов нужно на горизонт и что из этого следует для сбора."""
+    lines = [f"📋 <b>План:</b> {pl['ppd']} в день × {pl['days']} дн. = <b>{pl['target']}</b> постов вперёд",
+             f"Есть {pl['have']}: в отложке {pl['future']}, в очереди {pl['approved']}, на проверке {pl['pending']}"]
+    if pl["need"] <= 0:
+        lines.append("✅ Запас полон — сбор и обработка отдыхают")
+    else:
+        y = f"выход годных {pl['yield'] * 100:.0f}%" + ("" if pl["yield_sample"] >= 10 else " (пока оценка)")
+        lines.append(f"Не хватает <b>{pl['need']}</b> → нужно ~{pl['raw_needed']} материалов ({y}), "
+                     f"необработанных {pl['backlog']}")
+        lines.append("⬇️ Сбор: ещё ~" + str(pl["collect"]) if pl["collect"] else "⏳ Сбор не нужен — хватит необработанных")
+    return "\n".join(lines)
 
 
 async def _global_page(pipeline: Pipeline, note: str = "") -> tuple[str, object]:
@@ -505,7 +518,8 @@ async def on_settings(cb: CallbackQuery, pipeline: Pipeline, scheduler) -> None:
         await cb.answer(f"= {v}")
         if name == "collect_min" and scheduler.get_job(f"collect:{scope}"):
             scheduler.reschedule_job(f"collect:{scope}", trigger="interval", minutes=v)
-        if name in ("ppd", "buffer_days", "max_pending"):
+        if name in ("ppd", "buffer_days", "max_pending"):  # цель изменилась — пересчитать план сразу
+            asyncio.create_task(pipeline.collect_job(scope))
             asyncio.create_task(pipeline.process_job(scope))
             asyncio.create_task(pipeline.sync_job(scope))
         page = await (_global_page(pipeline) if scope == "global" else _channel_page(pipeline, scope))
