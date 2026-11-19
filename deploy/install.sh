@@ -4,7 +4,8 @@
 # Ничего чужого не трогает: отдельный системный пользователь, своя папка /opt/tgautoposting,
 # своя служба. Портов не открывает (бот работает через long polling) — nginx не нужен.
 #
-# Запуск:            sudo bash install.sh
+# Запуск:            curl -fsSL https://raw.githubusercontent.com/vvo1d/TGAutoPosting/main/deploy/install.sh | sudo bash
+#              или:  sudo bash install.sh
 # С переносом данных: sudo IMPORT_DIR=/tmp/tgap bash install.sh
 #   (в IMPORT_DIR лежат .env и папка data/ с Mac: autoposting.db, reader.session, media/)
 set -euo pipefail
@@ -12,7 +13,7 @@ set -euo pipefail
 APP=tgautoposting
 APP_USER=tgautoposting
 APP_DIR=/opt/tgautoposting
-REPO=${REPO:-git@github.com:vvo1d/TGAutoPosting.git}
+REPO=${REPO:-https://github.com/vvo1d/TGAutoPosting.git}  # для приватного репо: git@github.com:…
 IMPORT_DIR=${IMPORT_DIR:-}
 
 say() { echo -e "\n==> $*"; }
@@ -36,33 +37,40 @@ id -u "$APP_USER" >/dev/null 2>&1 \
 HOME_DIR=$(getent passwd "$APP_USER" | cut -d: -f6)
 as_app() { sudo -u "$APP_USER" -H "$@"; }
 
-say "Ключ доступа к GitHub (deploy key, только чтение)"
-KEY="$HOME_DIR/.ssh/id_ed25519"
-if [[ ! -f $KEY ]]; then
-  install -d -m 700 -o "$APP_USER" -g "$APP_USER" "$HOME_DIR/.ssh"
-  as_app ssh-keygen -q -t ed25519 -N "" -C "$APP@$(hostname)" -f "$KEY"
+SSH_CMD=""
+if [[ $REPO == git@* ]]; then
+  say "Ключ доступа к GitHub (deploy key, только чтение) — репозиторий приватный"
+  KEY="$HOME_DIR/.ssh/id_ed25519"
+  if [[ ! -f $KEY ]]; then
+    install -d -m 700 -o "$APP_USER" -g "$APP_USER" "$HOME_DIR/.ssh"
+    as_app ssh-keygen -q -t ed25519 -N "" -C "$APP@$(hostname)" -f "$KEY"
+  fi
+  SSH_CMD="ssh -i $KEY -o StrictHostKeyChecking=accept-new"
+  if ! as_app env GIT_SSH_COMMAND="$SSH_CMD" git ls-remote "$REPO" >/dev/null 2>&1; then
+    echo
+    echo "Добавьте этот ключ в GitHub: репозиторий → Settings → Deploy keys → Add deploy key"
+    echo "(галочку «Allow write access» НЕ ставить):"
+    echo
+    cat "$KEY.pub"
+    echo
+    read -rp "Добавили? Нажмите Enter… "
+    as_app env GIT_SSH_COMMAND="$SSH_CMD" git ls-remote "$REPO" >/dev/null \
+      || { echo "Нет доступа к $REPO — проверьте ключ"; exit 1; }
+  fi
 fi
-SSH_CMD="ssh -i $KEY -o StrictHostKeyChecking=accept-new"
-if ! as_app env GIT_SSH_COMMAND="$SSH_CMD" git ls-remote "$REPO" >/dev/null 2>&1; then
-  echo
-  echo "Добавьте этот ключ в GitHub: репозиторий TGAutoPosting → Settings → Deploy keys → Add deploy key"
-  echo "(галочку «Allow write access» НЕ ставить):"
-  echo
-  cat "$KEY.pub"
-  echo
-  read -rp "Добавили? Нажмите Enter… "
-  as_app env GIT_SSH_COMMAND="$SSH_CMD" git ls-remote "$REPO" >/dev/null \
-    || { echo "Нет доступа к $REPO — проверьте ключ"; exit 1; }
-fi
+
+GIT_ENV=()
+[[ -n $SSH_CMD ]] && GIT_ENV=("GIT_SSH_COMMAND=$SSH_CMD")
 
 say "Код в $APP_DIR"
 if [[ ! -d $APP_DIR/.git ]]; then
   install -d -o "$APP_USER" -g "$APP_USER" "$APP_DIR"
-  as_app env GIT_SSH_COMMAND="$SSH_CMD" git clone -q "$REPO" "$APP_DIR"
+  as_app env "${GIT_ENV[@]}" git clone -q "$REPO" "$APP_DIR"
 else
-  as_app env GIT_SSH_COMMAND="$SSH_CMD" git -C "$APP_DIR" pull --ff-only
+  as_app env "${GIT_ENV[@]}" git -C "$APP_DIR" pull --ff-only
 fi
-as_app git -C "$APP_DIR" config core.sshCommand "$SSH_CMD"   # чтобы /update в боте мог делать git pull
+# чтобы /update в боте мог делать git pull из приватного репо
+[[ -n $SSH_CMD ]] && as_app git -C "$APP_DIR" config core.sshCommand "$SSH_CMD"
 
 say "Python-окружение и зависимости"
 [[ -x $APP_DIR/.venv/bin/python ]] || as_app python3 -m venv "$APP_DIR/.venv"
