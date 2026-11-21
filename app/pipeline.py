@@ -22,6 +22,7 @@ from telethon.errors import ScheduleTooMuchError
 
 from app import deals, dedup
 from app.links import LinkResolver, canonical, wb_articles
+from app.max_api import MaxClient, MaxError
 from app.config import ChannelProfile, Settings
 from app.db import DB
 from app.models import RawPost
@@ -43,6 +44,7 @@ class Pipeline:
         self.settings, self.profiles, self.db, self.bot = settings, profiles, db, bot
         self.tg, self.web, self.rewriter = tg, web, rewriter
         self.links = LinkResolver()
+        self.max = MaxClient(settings.max_token) if settings.max_token else None
         self.market = MarketReader()
         # Сбор и обработка идут независимо: черновики появляются, пока сбор ещё качает видео
         self._collect_locks = {k: asyncio.Lock() for k in profiles}
@@ -52,6 +54,7 @@ class Pipeline:
         self._limit_notified: dict[str, bool] = {}
         self._quota_notified: set[str] = set()
         self._manual_adding = 0
+        self._max_lock = asyncio.Lock()
         self._budget, self._quota_left, self._video_mb = 0, 0, 0
 
     def moderation_chat(self, p: ChannelProfile) -> int:
@@ -316,7 +319,7 @@ class Pipeline:
             log.info("Уборка медиа отложена: идёт сбор")
             return 0, 0
         cur = await self.db.conn.execute(
-            "SELECT media FROM items WHERE status IN ('new','draft','pending','approved')")
+            "SELECT media FROM items WHERE status IN ('new','draft','pending','approved') OR max_status='queued'")
         keep = {str(Path(m["path"]).resolve().parent)
                 for (raw,) in await cur.fetchall() for m in json.loads(raw or "[]")}
         fresh = time.time() - 2 * 3600  # и на всякий случай не трогаем папки моложе 2 часов
@@ -646,7 +649,12 @@ class Pipeline:
             await self._notify(p, f"⚠️ Не удалось опубликовать #{item['id']}: {e}")
             return
         await self.db.update(item["id"], status="published")
-        self._cleanup(item)
+        if await self.max_chat(p.key):
+            await self.db.update(item["id"], max_status="queued",
+                                 max_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+            asyncio.create_task(self.max_job())
+        else:
+            self._cleanup(item)
         log.info("[%s] опубликован item %s", p.key, item["id"])
 
     # ---------- 3б. отложенные сообщения в канале ----------
@@ -691,6 +699,9 @@ class Pipeline:
                 await self.db.update(it["id"], status="published")
             else:
                 await self.db.update(it["id"], status="rejected", note="удалён из отложенных вручную")
+                if it.get("max_status") == "queued":
+                    await self.db.update(it["id"], max_status="cancelled")
+                    self._cleanup(it)
 
         # 2) одобренные -> в отложенные, пока не упрёмся в лимит
         count = len(existing)
@@ -724,7 +735,10 @@ class Pipeline:
                                  tg_msg_ids=ids)
             log.info("[%s] #%s в отложенных на %s", p.key, it["id"], slot.astimezone(ZoneInfo(p.timezone)))
             await self._mark_control(p, await self.db.get(it["id"]))
-            self._cleanup(it)
+            if await self.max_chat(p.key):  # в MAX опубликуем сами в ту же минуту — файлы нужны до тех пор
+                await self.db.update(it["id"], max_status="queued", max_at=slot.isoformat(timespec="seconds"))
+            else:
+                self._cleanup(it)
 
     def _limit_reached(self, p: ChannelProfile, count: int) -> None:
         if not self._limit_notified.get(p.key):
@@ -743,6 +757,54 @@ class Pipeline:
                 chat_id=self.moderation_chat(p), message_id=item["draft_msg_ids"][-1])
         except TelegramBadRequest:
             pass
+
+    # ---------- MAX ----------
+
+    async def max_chat(self, key: str) -> int | None:
+        if not self.max:
+            return None
+        v = await self.db.get_flag(f"max:{key}:chat")
+        return int(v) if v else None
+
+    async def set_max_chat(self, key: str, chat_id: int | None) -> None:
+        await self.db.set_flag(f"max:{key}:chat", str(chat_id) if chat_id else None)
+
+    async def max_job(self) -> None:
+        """Публикует в MAX посты, время которых подошло (в MAX нет отложенных сообщений в API)."""
+        if not self.max or self._max_lock.locked():
+            return
+        async with self._max_lock:
+            now = (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(timespec="seconds")
+            cur = await self.db.conn.execute(
+                "SELECT id FROM items WHERE max_status='queued' AND max_at<=? ORDER BY max_at, id LIMIT 20", (now,))
+            for (item_id,) in await cur.fetchall():
+                it = await self.db.get(item_id)
+                p = self.profiles.get(it["channel"])
+                chat = await self.max_chat(it["channel"]) if p else None
+                if not p or not chat:
+                    await self.db.update(item_id, max_status="cancelled", max_note="MAX для канала выключен")
+                    continue
+                if not self.media_ok(it):
+                    await self.db.update(item_id, max_status="failed", max_note="медиа не найдены на диске")
+                    continue
+                try:
+                    mid = await self.max.send_post(chat, it["media"], it["caption"] or "")
+                except Exception as e:
+                    prev = re.match(r"попытка (\d+)", it.get("max_note") or "")
+                    tries = (int(prev.group(1)) if prev else 0) + 1
+                    log.warning("[%s] MAX: #%s не опубликован (попытка %d): %s", p.key, item_id, tries, e)
+                    if tries >= 3:
+                        await self.db.update(item_id, max_status="failed", max_note=f"{e}"[:400])
+                        await self._notify(p, f"⚠️ MAX: пост #{item_id} не опубликован: {str(e)[:300]}")
+                        self._cleanup(it)
+                    else:
+                        retry = (datetime.now(timezone.utc) + timedelta(minutes=5 * tries)).isoformat(timespec="seconds")
+                        await self.db.update(item_id, max_at=retry, max_note=f"попытка {tries}: {e}"[:400])
+                    continue
+                await self.db.update(item_id, max_status="sent", max_mid=mid, max_note=None)
+                log.info("[%s] MAX: опубликован #%s", p.key, item_id)
+                self._cleanup(it)
+                await asyncio.sleep(1)  # лимит MAX — 2 сообщения в секунду в канал
 
     # ---------- helpers ----------
 

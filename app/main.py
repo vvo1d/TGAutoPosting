@@ -73,6 +73,15 @@ async def main() -> None:
             scheduler.add_job(pipeline.publish_next, OrTrigger(slots), args=[key], id=f"publish:{key}",
                               max_instances=1, coalesce=True, misfire_grace_time=600)
         log.info("Канал %s → %s, слоты: %s", p.title, p.target, ", ".join(p.schedule))
+    if pipeline.max:
+        # MAX: публикуем посты, время которых подошло (отложенных в API MAX нет) — раз в минуту
+        scheduler.add_job(pipeline.max_job, "interval", id="max", minutes=1,
+                          next_run_time=start + timedelta(seconds=15), max_instances=1, coalesce=True)
+        try:
+            me = await pipeline.max.me()
+            log.info("MAX: бот %s подключён", me.get("username") or me.get("name"))
+        except Exception as e:
+            log.warning("MAX: не удалось подключиться: %s", e)
     # Уборка: устаревшие необработанные посты и ненужные медиа — при старте и раз в час
     scheduler.add_job(pipeline.cleanup_job, "interval", id="cleanup", hours=1,
                       next_run_time=start + timedelta(seconds=2), max_instances=1, coalesce=True)
@@ -87,6 +96,7 @@ async def main() -> None:
         BotCommand(command="collect", description="Собрать посты сейчас"),
         BotCommand(command="publish", description="Опубликовать следующий из очереди"),
         BotCommand(command="settings", description="Настройки каналов, лимиты, диск"),
+        BotCommand(command="max", description="Публикация в MAX"),
         BotCommand(command="pause", description="Пауза сбора/постинга (кнопки — в /status)"),
         BotCommand(command="resume", description="Снять паузу"),
         BotCommand(command="server", description="Версия, диск, прокси"),
@@ -106,6 +116,8 @@ async def main() -> None:
         await web.stop()
         await pipeline.links.stop()
         await pipeline.market.stop()
+        if pipeline.max:
+            await pipeline.max.stop()
         await db.close()
         await bot.session.close()
 

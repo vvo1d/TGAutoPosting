@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     # HTTP 127.0.0.1:8118, как у Xray на сервере), Telegram идёт через него, иначе напрямую.
     # Можно задать явно: socks5://127.0.0.1:1080, http://127.0.0.1:8118; none — всегда напрямую.
     tg_proxy: str | None = "auto"
+    # MAX (max.ru): токен бота из business.max.ru → Чат-боты → Настройки. Пусто — MAX выключен.
+    max_token: str | None = None
 
     def model_post_init(self, _ctx) -> None:
         value = (self.tg_proxy or "").strip().lower()

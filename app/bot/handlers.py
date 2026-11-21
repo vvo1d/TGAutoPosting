@@ -47,7 +47,7 @@ async def cmd_help(msg: Message) -> None:
         "/status — статистика и очередь\n"
         "/collect — собрать и подготовить посты сейчас\n"
         "/publish &lt;канал&gt; — опубликовать следующий из очереди\n"
-        "/settings — все настройки каналов: проверка, постов в день, лимиты сбора и места на диске\n"
+        "/settings — все настройки каналов: проверка, постов в день, лимиты сбора и места на диске\n"        "/max — публикация в каналы MAX вместе с Telegram\n"
         "/pause, /resume [канал] [сбор|постинг] — пауза; без аргументов — всё. Кнопки паузы — под /status\n"
         "/server — версия, диск, прокси · /logs [N] — последние строки лога\n"
         "/update — обновить из GitHub и перезапуститься · /restart — перезапуск\n\n"
@@ -553,3 +553,61 @@ async def cmd_ppd(msg: Message, command: CommandObject, pipeline: Pipeline) -> N
     asyncio.create_task(pipeline.sync_job(args[0]))
     text, kb = await _channel_page(pipeline, args[0])
     await msg.answer(f"Готово: {n} постов в день.\n\n{text}", reply_markup=kb)
+
+
+# ---------- MAX ----------
+
+@router.message(Command("max"))
+async def cmd_max(msg: Message, command: CommandObject, pipeline: Pipeline) -> None:
+    """/max — статус и найденные каналы; /max канал chat_id — включить; /max канал off — выключить."""
+    if not pipeline.max:
+        await msg.answer("MAX не подключён: впишите MAX_TOKEN в .env на сервере и перезапустите (/restart).\n"
+                         "Токен: business.max.ru → Чат-боты → ⋮ → Настройки.")
+        return
+    args = (command.args or "").split()
+    if len(args) == 2 and args[0] in pipeline.profiles:
+        key = args[0]
+        if args[1].lower() in ("off", "выкл", "0"):
+            await pipeline.set_max_chat(key, None)
+            await msg.answer(f"MAX для {html_escape(pipeline.profiles[key].title)} выключен.")
+            return
+        try:
+            chat_id = int(args[1])
+            info = await pipeline.max.chat(chat_id)
+        except ValueError:
+            await msg.answer("chat_id — это число, например /max shop_sparks -71234567890")
+            return
+        except Exception as e:
+            await msg.answer(f"❌ MAX не даёт доступ к чату {args[1]}: {html_escape(str(e)[:300])}\n"
+                             "Проверьте, что бот добавлен в канал администратором.")
+            return
+        await pipeline.set_max_chat(key, chat_id)
+        await msg.answer(f"✅ {html_escape(pipeline.profiles[key].title)} → MAX «{html_escape(info.get('title') or str(chat_id))}».\n"
+                         "Новые посты будут выходить в MAX в ту же минуту, что и в Telegram.")
+        return
+
+    lines = []
+    try:
+        me = await pipeline.max.me()
+        lines.append(f"<b>MAX</b>: бот {html_escape(me.get('name') or '')} @{html_escape(me.get('username') or '')}")
+    except Exception as e:
+        await msg.answer(f"❌ MAX: не удалось подключиться: {html_escape(str(e)[:300])}")
+        return
+    for key, p in pipeline.profiles.items():
+        chat = await pipeline.max_chat(key)
+        cur = await pipeline.db.conn.execute(
+            "SELECT max_status, COUNT(*) FROM items WHERE channel=? AND max_status IS NOT NULL GROUP BY max_status", (key,))
+        st = {r[0]: r[1] for r in await cur.fetchall()}
+        lines.append(f"\n<b>{html_escape(p.title)}</b> ({key}): " + (f"→ MAX {chat}" if chat else "MAX выключен")
+                     + (f"\nв очереди {st.get('queued', 0)}, опубликовано {st.get('sent', 0)}, ошибок {st.get('failed', 0)}" if st else ""))
+    try:
+        chats = await pipeline.max.bot_chats()
+    except Exception as e:
+        chats = {}
+        lines.append(f"\n(не удалось получить список чатов: {html_escape(str(e)[:150])})")
+    if chats:
+        lines.append("\n<b>Каналы и чаты, куда добавлен бот:</b>")
+        lines += [f"• {html_escape(t or 'без названия')}: <code>{cid}</code>" for cid, t in chats.items()]
+    lines.append("\nВключить: <code>/max shop_sparks chat_id</code> · выключить: <code>/max shop_sparks off</code>\n"
+                 "Если канала нет в списке — добавьте бота в канал MAX администратором и повторите /max.")
+    await msg.answer("\n".join(lines))

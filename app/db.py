@@ -71,7 +71,8 @@ class DB:
         # Миграции: колонки для поиска дублей
         cur = await self.conn.execute("PRAGMA table_info(items)")
         cols = {r[1] for r in await cur.fetchall()}
-        for col in ("phash", "title_key", "ingr_key", "scheduled_at", "tg_msg_ids", "links"):
+        for col in ("phash", "title_key", "ingr_key", "scheduled_at", "tg_msg_ids", "links",
+                    "max_status", "max_at", "max_mid", "max_note"):
             if col not in cols:
                 await self.conn.execute(f"ALTER TABLE items ADD COLUMN {col} TEXT")
         await self.conn.commit()
