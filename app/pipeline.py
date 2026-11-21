@@ -30,7 +30,7 @@ from app.publisher import send_post
 from app.rules import AD_MARKERS
 from app.scheduler_tg import ChannelScheduler
 from app.settings_rt import CHANNEL_PARAMS, GLOBAL_PARAMS, clamp
-from app.rewriter import CAPTION_LIMIT, Rewriter, format_caption, html_escape, visible_len
+from app.rewriter import CAPTION_LIMIT, RecipePost, Rewriter, format_caption, html_escape, visible_len
 from app.sources.telegram import TelegramReader
 from app.sources.market import MarketReader
 from app.sources.web import WebReader
@@ -783,6 +783,39 @@ class Pipeline:
     async def max_known_chats(self) -> dict[int, str]:
         cur = await self.db.conn.execute("SELECT key, value FROM flags WHERE key LIKE 'max:known:%'")
         return {int(k.split(":")[2]): v for k, v in await cur.fetchall()}
+
+    async def max_test(self, key: str) -> str:
+        """Пробная публикация в MAX: свежий готовый пост канала (статус в Telegram не меняется).
+        Если готовых постов с медиа нет — пробный рецепт с povar.ru."""
+        chat = await self.max_chat(key)
+        if not chat:
+            raise RuntimeError("для канала не включён MAX (/max канал chat_id)")
+        cur = await self.db.conn.execute(
+            """SELECT id FROM items WHERE channel=? AND caption IS NOT NULL
+                 AND status IN ('pending','approved','draft','scheduled') ORDER BY id DESC LIMIT 30""", (key,))
+        for (item_id,) in await cur.fetchall():
+            it = await self.db.get(item_id)
+            if self.media_ok(it):
+                mid = await self.max.send_post(chat, it["media"], it["caption"])
+                return f"пост #{item_id} ({it['status']}, медиа: {len(it['media'])}), mid {mid}"
+        # Готовых постов с файлами нет — пробный рецепт
+        res = await self.web.fetch_recipe("https://povar.ru/recipes/salat_mimoza_s_syrom_i_maslom-16189.html")
+        if not res:
+            raise RuntimeError("нет готовых постов с медиа и не удалось взять пробный рецепт")
+        post, images = res
+        media = await self.web.download_images(images[:1], self.settings.media_dir / key / "_maxtest")
+        caption = format_caption(RecipePost(
+            is_recipe=True, reject_reason=None, title="Салат «Мимоза» с сыром и маслом", emoji="🥗",
+            intro="Пробный пост: проверяем публикацию в MAX.", time=None, servings=None, difficulty="легко",
+            rubric="салаты", ingredients=["Рыбные консервы — 1 банка", "Яйца — 5 шт.", "Сыр — 100 г",
+                                          "Сливочное масло — 80 г", "Лук — 1 шт.", "Майонез — по вкусу"],
+            steps=["Отварите яйца, разделите на белки и желтки.", "Выкладывайте слоями: белки, сыр, рыба, лук, масло.",
+                   "Посыпьте тёртыми желтками."]))
+        try:
+            mid = await self.max.send_post(chat, media, caption)
+        finally:
+            shutil.rmtree(self.settings.media_dir / key / "_maxtest", ignore_errors=True)
+        return f"пробный рецепт (готовых постов с медиа не нашлось), mid {mid}"
 
     async def max_job(self) -> None:
         """Публикует в MAX посты, время которых подошло (в MAX нет отложенных сообщений в API)."""

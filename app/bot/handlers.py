@@ -617,3 +617,24 @@ async def cmd_max(msg: Message, command: CommandObject, pipeline: Pipeline) -> N
                  "Если канала нет в списке — уберите бота из администраторов канала MAX и назначьте заново: "
                  "MAX сообщает о добавлении только в этот момент. Через минуту повторите /max.")
     await msg.answer("\n".join(lines))
+
+
+@router.message(Command("maxtest"))
+async def cmd_maxtest(msg: Message, command: CommandObject, pipeline: Pipeline) -> None:
+    """Пробная публикация в MAX: /maxtest [канал] (по умолчанию — первый канал с включённым MAX)."""
+    if not pipeline.max:
+        await msg.answer("MAX не подключён (нет MAX_TOKEN в .env).")
+        return
+    key = (command.args or "").strip()
+    if not key:
+        key = next((k for k in pipeline.profiles if await pipeline.max_chat(k)), "")
+    if key not in pipeline.profiles:
+        await msg.answer(f"Укажите канал: /maxtest taste_recipe. Каналы: {', '.join(pipeline.profiles)}")
+        return
+    await msg.answer("Публикую пробный пост в MAX… (видео может обрабатываться до пары минут)")
+    try:
+        info = await pipeline.max_test(key)
+    except Exception as e:
+        await msg.answer(f"❌ MAX: {html_escape(str(e)[:500])}")
+        return
+    await msg.answer(f"✅ Опубликовано в MAX: {html_escape(info)}. Проверьте канал.")
