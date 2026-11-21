@@ -587,7 +587,9 @@ async def cmd_max(msg: Message, command: CommandObject, pipeline: Pipeline) -> N
             return
         await pipeline.set_max_chat(key, chat_id)
         await msg.answer(f"✅ {html_escape(pipeline.profiles[key].title)} → MAX «{html_escape(info.get('title') or str(chat_id))}».\n"
-                         "Новые посты будут выходить в MAX в ту же минуту, что и в Telegram.")
+                         "Новые посты будут выходить в MAX в ту же минуту, что и в Telegram.\n"
+                         "Ставлю в очередь MAX посты, которые уже стоят в отложке Telegram…")
+        asyncio.create_task(_backfill_and_report(msg, pipeline, key))
         return
 
     lines = []
@@ -638,3 +640,31 @@ async def cmd_maxtest(msg: Message, command: CommandObject, pipeline: Pipeline) 
         await msg.answer(f"❌ MAX: {html_escape(str(e)[:500])}")
         return
     await msg.answer(f"✅ Опубликовано в MAX: {html_escape(info)}. Проверьте канал.")
+
+
+async def _backfill_and_report(msg: Message, pipeline: Pipeline, key: str) -> None:
+    try:
+        rep = await pipeline.max_backfill(key)
+    except Exception as e:
+        await msg.answer(f"❌ Досинхронизация с MAX не удалась: {html_escape(str(e)[:400])}")
+        return
+    text = f"🔁 {html_escape(pipeline.profiles[key].title)}: в очередь MAX поставлено {rep['queued']} постов из отложки Telegram"
+    if rep["missing"]:
+        text += f"; не найдено в отложке {rep['missing']} (уже вышли или удалены)"
+    if rep["failed"]:
+        text += f"; не удалось скачать {rep['failed']} (повторите /maxsync)"
+    await msg.answer(text + ". Они выйдут в MAX в то же время, что и в Telegram.")
+
+
+@router.message(Command("maxsync"))
+async def cmd_maxsync(msg: Message, command: CommandObject, pipeline: Pipeline) -> None:
+    """Поставить в очередь MAX посты, уже стоящие в отложке Telegram: /maxsync [канал]."""
+    keys = [(command.args or "").strip()] if (command.args or "").strip() else [
+        k for k in pipeline.profiles if await pipeline.max_chat(k)]
+    keys = [k for k in keys if k in pipeline.profiles and await pipeline.max_chat(k)]
+    if not keys:
+        await msg.answer("Нет каналов с включённым MAX. Включите: /max канал chat_id")
+        return
+    await msg.answer("Скачиваю посты из отложки Telegram и ставлю в очередь MAX…")
+    for k in keys:
+        await _backfill_and_report(msg, pipeline, k)

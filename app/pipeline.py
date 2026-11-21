@@ -25,7 +25,7 @@ from app.links import LinkResolver, canonical, wb_articles
 from app.max_api import MaxClient, MaxError
 from app.config import ChannelProfile, Settings
 from app.db import DB
-from app.models import RawPost
+from app.models import MediaFile, RawPost
 from app.publisher import send_post
 from app.rules import AD_MARKERS
 from app.scheduler_tg import ChannelScheduler
@@ -783,6 +783,51 @@ class Pipeline:
     async def max_known_chats(self) -> dict[int, str]:
         cur = await self.db.conn.execute("SELECT key, value FROM flags WHERE key LIKE 'max:known:%'")
         return {int(k.split(":")[2]): v for k, v in await cur.fetchall()}
+
+    async def max_backfill(self, key: str) -> dict[str, int]:
+        """Посты, которые уже стоят в отложке Telegram, но не в очереди MAX (MAX включили позже):
+        скачиваем их медиа обратно из отложенных сообщений и ставим в очередь MAX на то же время.
+        Текст берём из самого отложенного сообщения — с вашими ручными правками."""
+        from telethon.extensions import html as tg_html
+
+        p = self.profiles[key]
+        rep = {"queued": 0, "missing": 0, "failed": 0}
+        if not await self.max_chat(key) or not self.channel_scheduler:
+            return rep
+        existing = {m.id: m for m in await self.channel_scheduler.scheduled(p.target)}
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        cur = await self.db.conn.execute(
+            """SELECT id FROM items WHERE channel=? AND status='scheduled' AND scheduled_at>?
+                 AND (max_status IS NULL OR max_status IN ('cancelled','failed')) ORDER BY scheduled_at""", (key, now))
+        for (item_id,) in await cur.fetchall():
+            it = await self.db.get(item_id)
+            msgs = [existing[i] for i in it["tg_msg_ids"] if i in existing]
+            if not msgs:
+                rep["missing"] += 1
+                continue
+            dest = self.settings.media_dir / key / f"max_{item_id}"
+            dest.mkdir(parents=True, exist_ok=True)
+            media: list[MediaFile] = []
+            try:
+                for m in msgs:
+                    kind = "video" if m.video else "photo" if m.photo else None
+                    if not kind:
+                        continue
+                    path = await self.tg.client.download_media(m, file=str(dest / str(m.id)))
+                    if path:
+                        media.append(MediaFile(kind=kind, path=str(path)))
+            except Exception as e:
+                log.warning("[%s] MAX: не скачал медиа отложенного поста #%s: %s", key, item_id, e)
+                shutil.rmtree(dest, ignore_errors=True)
+                rep["failed"] += 1
+                continue
+            first = next((m for m in msgs if m.message), None)
+            caption = tg_html.unparse(first.message, first.entities or []) if first else (it["caption"] or "")
+            await self.db.update(item_id, media=media, caption=caption, max_status="queued",
+                                 max_at=it["scheduled_at"], max_note=None)
+            rep["queued"] += 1
+        log.info("[%s] MAX: досинхронизация отложки — %s", key, rep)
+        return rep
 
     async def max_test(self, key: str) -> str:
         """Пробная публикация в MAX: свежий готовый пост канала (статус в Telegram не меняется).
