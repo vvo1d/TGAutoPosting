@@ -72,6 +72,11 @@ class MaxClient:
     async def chat(self, chat_id: int) -> dict:
         return await self._call("GET", f"/chats/{chat_id}")
 
+    async def chat_by_link(self, link: str) -> dict:
+        """Канал по публичной ссылке: https://max.ru/channel_Name или просто channel_Name."""
+        slug = re.sub(r"^(https?://)?(web\.)?max\.ru/", "", link.strip()).strip("/@ ")
+        return await self._call("GET", f"/chats/{slug}")
+
     async def bot_chats(self) -> dict[int, str]:
         """Каналы и чаты, куда добавили бота (из событий bot_added; списка чатов в API MAX нет)."""
         data = await self._call("GET", "/updates", params={"timeout": 0, "limit": 1000,

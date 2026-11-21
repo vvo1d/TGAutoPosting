@@ -572,11 +572,12 @@ async def cmd_max(msg: Message, command: CommandObject, pipeline: Pipeline) -> N
             await msg.answer(f"MAX для {html_escape(pipeline.profiles[key].title)} выключен.")
             return
         try:
-            chat_id = int(args[1])
-            info = await pipeline.max.chat(chat_id)
-        except ValueError:
-            await msg.answer("chat_id — это число, например /max shop_sparks -71234567890")
-            return
+            if re.fullmatch(r"-?\d+", args[1]):
+                chat_id = int(args[1])
+                info = await pipeline.max.chat(chat_id)
+            else:  # ссылка на канал: https://max.ru/channel_Name
+                info = await pipeline.max.chat_by_link(args[1])
+                chat_id = int(info["chat_id"])
         except Exception as e:
             await msg.answer(f"❌ MAX не даёт доступ к чату {args[1]}: {html_escape(str(e)[:300])}\n"
                              "Проверьте, что бот добавлен в канал администратором.")
@@ -608,6 +609,7 @@ async def cmd_max(msg: Message, command: CommandObject, pipeline: Pipeline) -> N
     if chats:
         lines.append("\n<b>Каналы и чаты, куда добавлен бот:</b>")
         lines += [f"• {html_escape(t or 'без названия')}: <code>{cid}</code>" for cid, t in chats.items()]
-    lines.append("\nВключить: <code>/max shop_sparks chat_id</code> · выключить: <code>/max shop_sparks off</code>\n"
+    lines.append("\nВключить: <code>/max shop_sparks chat_id</code> или <code>/max shop_sparks https://max.ru/ссылка_канала</code>"
+                 " · выключить: <code>/max shop_sparks off</code>\n"
                  "Если канала нет в списке — добавьте бота в канал MAX администратором и повторите /max.")
     await msg.answer("\n".join(lines))
