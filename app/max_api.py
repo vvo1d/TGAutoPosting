@@ -77,21 +77,24 @@ class MaxClient:
         slug = re.sub(r"^(https?://)?(web\.)?max\.ru/", "", link.strip()).strip("/@ ")
         return await self._call("GET", f"/chats/{slug}")
 
-    async def bot_chats(self) -> dict[int, str]:
-        """Каналы и чаты, куда добавили бота (из событий bot_added; списка чатов в API MAX нет)."""
-        data = await self._call("GET", "/updates", params={"timeout": 0, "limit": 1000,
-                                                           "types": "bot_added,bot_started,message_created"})
+    async def poll_chats(self, marker: int | None) -> tuple[dict[int, str], int | None]:
+        """Забирает события и возвращает {chat_id: название} чатов/каналов из них и новый marker.
+        MAX отдаёт событие один раз, поэтому найденное нужно сохранять (см. pipeline.max_poll)."""
+        params = {"timeout": 0, "limit": 1000}
+        if marker:
+            params["marker"] = marker
+        data = await self._call("GET", "/updates", params=params)
         found: dict[int, str] = {}
         for u in data.get("updates", []):
-            cid = u.get("chat_id") or (u.get("message") or {}).get("recipient", {}).get("chat_id")
-            if cid:
+            cid = u.get("chat_id") or ((u.get("message") or {}).get("recipient") or {}).get("chat_id")
+            if cid and u.get("update_type") != "bot_removed":
                 found[int(cid)] = ""
         for cid in list(found):
             try:
                 found[cid] = (await self.chat(cid)).get("title") or ""
             except MaxError:
                 pass
-        return found
+        return found, data.get("marker") or marker
 
     async def upload(self, m: MediaFile) -> dict:
         kind = "video" if m.kind == "video" else "image"

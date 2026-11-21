@@ -572,6 +572,9 @@ async def cmd_max(msg: Message, command: CommandObject, pipeline: Pipeline) -> N
             await msg.answer(f"MAX для {html_escape(pipeline.profiles[key].title)} выключен.")
             return
         try:
+            known = {t.lower(): cid for cid, t in (await pipeline.max_known_chats()).items() if t}
+            if args[1].lower() in known:  # можно указать название канала из списка /max
+                args[1] = str(known[args[1].lower()])
             if re.fullmatch(r"-?\d+", args[1]):
                 chat_id = int(args[1])
                 info = await pipeline.max.chat(chat_id)
@@ -602,14 +605,15 @@ async def cmd_max(msg: Message, command: CommandObject, pipeline: Pipeline) -> N
         lines.append(f"\n<b>{html_escape(p.title)}</b> ({key}): " + (f"→ MAX {chat}" if chat else "MAX выключен")
                      + (f"\nв очереди {st.get('queued', 0)}, опубликовано {st.get('sent', 0)}, ошибок {st.get('failed', 0)}" if st else ""))
     try:
-        chats = await pipeline.max.bot_chats()
+        await pipeline.max_poll()
     except Exception as e:
-        chats = {}
-        lines.append(f"\n(не удалось получить список чатов: {html_escape(str(e)[:150])})")
+        lines.append(f"\n(не удалось получить события MAX: {html_escape(str(e)[:150])})")
+    chats = await pipeline.max_known_chats()
     if chats:
         lines.append("\n<b>Каналы и чаты, куда добавлен бот:</b>")
         lines += [f"• {html_escape(t or 'без названия')}: <code>{cid}</code>" for cid, t in chats.items()]
     lines.append("\nВключить: <code>/max shop_sparks chat_id</code> или <code>/max shop_sparks https://max.ru/ссылка_канала</code>"
                  " · выключить: <code>/max shop_sparks off</code>\n"
-                 "Если канала нет в списке — добавьте бота в канал MAX администратором и повторите /max.")
+                 "Если канала нет в списке — уберите бота из администраторов канала MAX и назначьте заново: "
+                 "MAX сообщает о добавлении только в этот момент. Через минуту повторите /max.")
     await msg.answer("\n".join(lines))

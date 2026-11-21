@@ -769,10 +769,29 @@ class Pipeline:
     async def set_max_chat(self, key: str, chat_id: int | None) -> None:
         await self.db.set_flag(f"max:{key}:chat", str(chat_id) if chat_id else None)
 
+    async def max_poll(self) -> dict[int, str]:
+        """Забираем события MAX и запоминаем каналы, куда добавили бота (событие приходит один раз)."""
+        marker = await self.db.get_flag("max:marker")
+        found, new_marker = await self.max.poll_chats(int(marker) if marker else None)
+        for cid, title in found.items():
+            await self.db.set_flag(f"max:known:{cid}", title or "")
+            log.info("MAX: бот добавлен в «%s» (chat_id %s)", title, cid)
+        if new_marker:
+            await self.db.set_flag("max:marker", str(new_marker))
+        return found
+
+    async def max_known_chats(self) -> dict[int, str]:
+        cur = await self.db.conn.execute("SELECT key, value FROM flags WHERE key LIKE 'max:known:%'")
+        return {int(k.split(":")[2]): v for k, v in await cur.fetchall()}
+
     async def max_job(self) -> None:
         """Публикует в MAX посты, время которых подошло (в MAX нет отложенных сообщений в API)."""
         if not self.max or self._max_lock.locked():
             return
+        try:
+            await self.max_poll()
+        except Exception as e:
+            log.debug("MAX: события не получены: %s", e)
         async with self._max_lock:
             now = (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(timespec="seconds")
             cur = await self.db.conn.execute(
