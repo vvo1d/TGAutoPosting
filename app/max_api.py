@@ -47,9 +47,10 @@ def tg_html_to_max(html: str) -> str:
 
 class MaxClient:
     def __init__(self, token: str):
+        # MAX — российский сервис: всегда напрямую, мимо VPN/прокси (trust_env=False игнорирует HTTPS_PROXY и т.п.)
         self.http = httpx.AsyncClient(base_url=API, headers={"Authorization": token}, timeout=120,
-                                      verify=ssl_context())
-        self.up = httpx.AsyncClient(timeout=600, verify=ssl_context())  # загрузка файлов на CDN MAX
+                                      verify=ssl_context(), trust_env=False)
+        self.up = httpx.AsyncClient(timeout=600, verify=ssl_context(), trust_env=False)  # загрузка на CDN MAX
 
     async def stop(self) -> None:
         await self.http.aclose()
