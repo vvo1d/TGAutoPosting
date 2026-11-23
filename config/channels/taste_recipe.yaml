@@ -48,6 +48,14 @@ sources:
     - username: ppreceptiki         # ПП Рецепты | Здоровое питание: ~112K, ~400 просм.
       min_age_hours: 6
       min_views: 300
+    - username: iamcook             # Аймкук — рецепты с фото и видео
+      min_age_hours: 4
+      min_views: 300
+      initial_limit: 30
+    - username: edimdomaru          # Едим Дома — рецепты с ингредиентами и шагами
+      min_age_hours: 4
+      min_views: 300
+      initial_limit: 30
 
     # --- крупные приватные (по данным Telemetr). Нужна ссылка-приглашение t.me/+XXXX:
     #     найдите канал в поиске Telegram и скопируйте ссылку из описания или из «Поделиться».
@@ -77,11 +85,18 @@ sources:
       max_entries: 10
     - rss: https://1000.menu/feed/news
       max_entries: 10
-    - rss: https://www.gastronom.ru/rss    # в ленте есть и новости, они отсеются
-      max_entries: 15
     - rss: https://www.say7.info/rss.xml
       max_entries: 10
     # Сайты без RSS: берём ссылки на рецепты со страницы каталога
+    - pages: [https://www.gastronom.ru/recipe]
+      link_pattern: '^https://www\.gastronom\.ru/recipe/\d+/[^/?#]+/?$'
+      max_entries: 15
+    - pages: [https://www.iamcook.ru/]
+      link_pattern: '^https://www\.iamcook\.ru/showrecipe/\d+/?$'
+      max_entries: 20
+    - pages: [https://gotovim-doma.ru/]
+      link_pattern: '^https://(?:www\.)?gotovim-doma\.ru/recipe/\d+-[^/?#]+/?$'
+      max_entries: 15
     - pages: [https://eda.ru/recepty]
       link_pattern: 'eda\.ru/recepty/[a-z\-]+/[a-z0-9\-]+-\d+$'
       max_entries: 10

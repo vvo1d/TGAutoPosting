@@ -253,8 +253,7 @@ class Pipeline:
                 added += await self._collect_web(p, src, budget)
             except Exception as e:
                 log.warning("[%s] сайт %s: %s", p.key, src.rss or src.pages or src.urls, e)
-        if added:
-            log.info("[%s] новых материалов: %d", p.key, added)
+        log.info("[%s] сбор завершён, новых материалов: %d", p.key, added)
         return added
 
     async def _collect_tg(self, p: ChannelProfile, src, budget: CollectionBudget) -> int:
