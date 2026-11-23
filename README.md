@@ -56,7 +56,11 @@ cp .env.example .env   # заполнить
    ```bash
    python -m scripts.login
    ```
-3. **Модель:** по умолчанию SambaNova: ключ с [cloud.sambanova.ai](https://cloud.sambanova.ai) → `LLM_API_KEY`, модель `LLM_MODEL`. Подойдёт любой OpenAI-совместимый API (`LLM_BASE_URL`). Для Claude: `LLM_PROVIDER=anthropic` и `ANTHROPIC_API_KEY`.
+3. **Модель.** Настройте `LLM_BASE_URL`, `LLM_MODEL` и при необходимости `LLM_API_KEY` в `.env`. Для Claude используйте `LLM_PROVIDER=anthropic` и `ANTHROPIC_API_KEY`. Перед запуском проверьте редактор командой `python -m scripts.check_llm`: она отправляет тестовую новость и отдельно проверяет резервную модель, если та настроена. Команда работает без обращения к Telegram и базе.
+
+   Для анонимного доступа начните с `LLM_RPM=1`. Ограничение частоты запросов снижает пиковую нагрузку. Общая квота провайдера по токенам и запросам действует отдельно. При HTTP 429 приложение ждёт по `Retry-After` или 60 секунд, если заголовка нет, и тем временем использует резерв при наличии. Резерв настраивается через `LLM_FALLBACK_BASE_URL`, `LLM_FALLBACK_MODEL`, `LLM_FALLBACK_API_KEY` и `LLM_FALLBACK_RPM`.
+
+   Для параллельного локального запуска и работы сервера используйте отдельный токен бота и отдельно авторизованную Telethon-сессию. Серверный бот продолжит обслуживать своё развёртывание.
 4. **Админы:** свой Telegram id (узнать у [@userinfobot](https://t.me/userinfobot)) в `ADMIN_IDS`.
 5. **Источники** задаются в `sources` профиля канала. Для @TasteRecipe они уже вписаны и проверены.
    - Telegram: публичный канал — `username`, приватный — `invite: https://t.me/+XXXX` (аккаунт-читатель вступит сам).

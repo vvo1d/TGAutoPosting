@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from openai import APIConnectionError
 from telethon.errors import AuthKeyDuplicatedError, ScheduleTooMuchError, UnauthorizedError
 
 from app import deals, dedup
@@ -387,8 +388,9 @@ class Pipeline:
                 # Лимит (429), сбой сервера (5xx), нет оплаты (402), модель снята (410), неверный ключ (401):
                 # материал не виноват — оставляем его в очереди и сообщаем модератору
                 status = getattr(e, "status_code", None)
-                if status in (401, 402, 404, 410, 429) or (status and status >= 500):
-                    log.warning("[%s] LLM недоступна (%s), продолжу позже: %s", p.key, status, str(e)[:200])
+                if isinstance(e, APIConnectionError) or status in (401, 402, 404, 410, 429) or (status and status >= 500):
+                    log.warning("[%s] LLM недоступна (%s), продолжу позже: %s",
+                                p.key, status or type(e).__name__, str(e)[:200])
                     if status in (401, 402, 404, 410):
                         await self._notify(p, f"⚠️ Модель недоступна ({status}): {str(e)[:300]}")
                     return

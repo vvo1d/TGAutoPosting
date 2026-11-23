@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     llm_fallback_model: str | None = None
     llm_fallback_api_key: str | None = None
     llm_fallback_rpm: int = Field(default=0, ge=0)
+    llm_fallback_vision: bool | None = None  # None — наследует LLM_VISION
 
 
     claude_model: str = "claude-opus-5-5"

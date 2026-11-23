@@ -146,6 +146,9 @@ class Rewriter:
 
 {profile.style}
 
+Для этого ответа поле body должно содержать только факты из исходного материала, без выводов о популярности,
+общих советов или хэштегов. Достаточно двух предложений, если фактов мало. Хэштеги добавляет приложение.
+
 Примеры подачи:
 {examples}"""
         prompt = f"Исходный материал:\n<source>\n{text.strip()}\n</source>"
@@ -235,6 +238,7 @@ class OpenAICompatBackend:
     def __init__(self, settings: Settings):
         self.model = settings.llm_model
         self.vision = settings.llm_vision
+        self.fallback_vision = self.vision if settings.llm_fallback_vision is None else settings.llm_fallback_vision
         self._max_images = 4
         self._locks = {}
         self._intervals = {}
@@ -310,7 +314,9 @@ class OpenAICompatBackend:
         from openai import APIConnectionError
 
         try:
-            return await self._complete_with(self.client, self.model, system, prompt, images, model_cls)
+            return await self._complete_with(
+                self.client, self.model, system, prompt, images if self.vision else [], model_cls
+            )
         except Exception as e:
             status = getattr(e, "status_code", None)
             temporary = isinstance(e, APIConnectionError) or status == 429 or (status is not None and status >= 500)
@@ -318,7 +324,8 @@ class OpenAICompatBackend:
                 raise
             log.info("Основная LLM недоступна (%s). Использую %s", status or type(e).__name__, self.fallback_model)
             return await self._complete_with(
-                self.fallback_client, self.fallback_model, system, prompt, images, model_cls
+                self.fallback_client, self.fallback_model, system, prompt,
+                images if self.fallback_vision else [], model_cls
             )
 
     async def _complete_with(self, client, model: str, system: str, prompt: str, images: list[str], model_cls: type[BaseModel]):
@@ -329,7 +336,7 @@ class OpenAICompatBackend:
         sys_json = system + "\n\nОтветь строго одним JSON-объектом по схеме:\n" + json.dumps(schema, ensure_ascii=False)
 
         content = [{"type": "text", "text": prompt}]
-        if images and self.vision:
+        if images:
             for img in images[: self._max_images]:
                 content.insert(0, {
                     "type": "image_url",
@@ -385,7 +392,8 @@ NEWS_TAGS = "#покер #новости"
 
 
 def news_text(post: NewsPost) -> str:
-    return f"{post.title.strip()}\n\n{post.body.strip()}\n\n{NEWS_TAGS}"
+    body = re.sub(r"(?m)^\s*(?:#[\w-]+[ \t]*)+\s*$", "", post.body).strip()
+    return f"{post.title.strip()}\n\n{body}\n\n{NEWS_TAGS}"
 
 
 def format_news(post: NewsPost) -> str:
