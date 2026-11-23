@@ -11,6 +11,7 @@ import random
 import logging
 import shutil
 import time
+from dataclasses import dataclass
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -39,6 +40,12 @@ from app.sources.web import WebReader
 log = logging.getLogger(__name__)
 
 
+@dataclass
+class CollectionBudget:
+    remaining: int
+    video_mb: int
+
+
 class Pipeline:
     def __init__(self, settings: Settings, profiles: dict[str, ChannelProfile], db: DB, bot: Bot,
                  tg: TelegramReader | None, web: WebReader, rewriter: Rewriter):
@@ -56,7 +63,7 @@ class Pipeline:
         self._quota_notified: set[str] = set()
         self._manual_adding = 0
         self._max_lock = asyncio.Lock()
-        self._budget, self._quota_left, self._video_mb = 0, 0, 0
+        self._collect_quota_left: int | None = None
 
     def moderation_chat(self, p: ChannelProfile) -> int:
         chat = p.moderation_chat or (self.settings.admin_ids[0] if self.settings.admin_ids else None)
@@ -71,7 +78,9 @@ class Pipeline:
     # ---------- 1. сбор ----------
 
     async def tick(self, key: str) -> None:
-        """Ручной запуск (/collect): собрать новое и сразу подготовить черновики."""
+        """Ручной запуск (/collect): разложить готовые посты, собрать и обработать новые."""
+        if self.uses_scheduled(self.profiles[key]):
+            asyncio.create_task(self.sync_job(key))
         await self.collect_job(key)
         await self.process_job(key)
 
@@ -125,6 +134,9 @@ class Pipeline:
                 await self.collect(self.profiles[key])
             except Exception:
                 log.exception("[%s] сбор упал", key)
+            finally:
+                if not any(lock.locked() for other, lock in self._collect_locks.items() if other != key):
+                    self._collect_quota_left = None
 
     async def process_job(self, key: str) -> None:
         if await self.is_paused(key, "collect") or self._process_locks[key].locked():
@@ -207,7 +219,11 @@ class Pipeline:
             return 0
         quota = await self.setting("global", "media_mb") * 1_000_000
         usage = await self.media_usage()
-        if usage >= quota:
+        remaining = quota - usage
+        if self._collect_quota_left is not None:
+            # Другой сбор мог скачать файлы, пока обход диска был в рабочем потоке.
+            remaining = min(remaining, self._collect_quota_left)
+        if remaining <= 0:
             log.warning("[%s] медиа на диске больше лимита (%.0f МБ) — сбор пропущен", p.key, quota / 1e6)
             await self._notify_once(p, "media_quota",
                                     f"⚠️ Медиа на диске достигли лимита {quota / 1e6:.0f} МБ — сбор остановлен, пока не освободится место. "
@@ -215,11 +231,13 @@ class Pipeline:
             return 0
         self._quota_notified.discard("media_quota")
         # Бюджет сбора: сколько нужно по плану, но не больше per_run и свободного места в очереди
-        self._budget = min(plan["collect"], await self.setting(p.key, "per_run"), max_new - backlog)
+        self._collect_quota_left = remaining
+        budget = CollectionBudget(
+            remaining=min(plan["collect"], await self.setting(p.key, "per_run"), max_new - backlog),
+            video_mb=await self.setting(p.key, "video_mb"),
+        )
         log.info("[%s] не хватает %d постов (выход годных %.0f%%) — собираю до %d материалов",
-                 p.key, plan["need"], plan["yield"] * 100, self._budget)
-        self._video_mb = await self.setting(p.key, "video_mb")
-        self._quota_left = quota - usage
+                 p.key, plan["need"], plan["yield"] * 100, budget.remaining)
         added = 0
         # Обходим источники в случайном порядке, чтобы ни один не был всегда первым
         tg_sources = random.sample(p.sources.telegram, len(p.sources.telegram))
@@ -227,25 +245,25 @@ class Pipeline:
         if self.tg:
             for src in tg_sources:
                 try:
-                    added += await self._collect_tg(p, src)
+                    added += await self._collect_tg(p, src, budget)
                 except Exception as e:
                     log.warning("[%s] источник %s: %s", p.key, src.label, e)
         for src in web_sources:
             try:
-                added += await self._collect_web(p, src)
+                added += await self._collect_web(p, src, budget)
             except Exception as e:
                 log.warning("[%s] сайт %s: %s", p.key, src.rss or src.pages or src.urls, e)
         if added:
             log.info("[%s] новых материалов: %d", p.key, added)
         return added
 
-    async def _collect_tg(self, p: ChannelProfile, src) -> int:
+    async def _collect_tg(self, p: ChannelProfile, src, budget: CollectionBudget) -> int:
         source = f"tg:{src.key}"
         last_id = await self.db.get_last_id(p.key, source)
         candidates, new_last = await self.tg.fetch(src, last_id, allow_text=p.content_type == "news")
         added = 0
         for n, c in enumerate(candidates):
-            if self._budget <= 0 or self._quota_left <= 0:
+            if budget.remaining <= 0 or (self._collect_quota_left or 0) <= 0:
                 # Лимит сбора: остальное заберём в следующий раз — позицию двигаем только до обработанного
                 new_last = max(m.id for m in candidates[n - 1].messages) if n else last_id
                 break
@@ -254,21 +272,21 @@ class Pipeline:
                 c.post.text = f"{c.post.text}\n\n{extra}"
             if await self.db.is_known(p.key, c.post):
                 continue
-            c.post.media = await self.tg.download(c, self._media_dir(p, c.post), self._video_mb)
+            c.post.media = await self.tg.download(c, self._media_dir(p, c.post), budget.video_mb)
             if not c.post.media and not (p.content_type == "news" and c.post.text.strip()):
                 continue
             if item_id := await self.db.add_item(p.key, c.post):
+                self._spend(budget, c.post.media)
                 await self.db.update(item_id, phash=await asyncio.to_thread(dedup.media_hash, c.post.media))
                 added += 1
-                self._spend(c.post.media)
         if new_last is not None:
             await self.db.set_last_id(p.key, source, new_last)
         return added
 
-    async def _collect_web(self, p: ChannelProfile, src) -> int:
+    async def _collect_web(self, p: ChannelProfile, src, budget: CollectionBudget) -> int:
         added = 0
         for url in await self.web.list_urls(src):
-            if self._budget <= 0 or self._quota_left <= 0:
+            if budget.remaining <= 0 or (self._collect_quota_left or 0) <= 0:
                 break
             cur = await self.db.conn.execute("SELECT 1 FROM items WHERE channel=? AND source_ref=?", (p.key, url))
             if await cur.fetchone():
@@ -281,14 +299,16 @@ class Pipeline:
                 continue
             post.media = await self.web.download_images(images, self._media_dir(p, post))
             if post.media and (item_id := await self.db.add_item(p.key, post)):
+                self._spend(budget, post.media)
                 await self.db.update(item_id, phash=await asyncio.to_thread(dedup.media_hash, post.media))
                 added += 1
-                self._spend(post.media)
         return added
 
-    def _spend(self, media: list) -> None:
-        self._budget -= 1
-        self._quota_left -= sum(Path(m.path).stat().st_size for m in media if Path(m.path).exists())
+    def _spend(self, budget: CollectionBudget, media: list) -> None:
+        budget.remaining -= 1
+        self._collect_quota_left = (self._collect_quota_left or 0) - sum(
+            Path(m.path).stat().st_size for m in media if Path(m.path).exists()
+        )
 
     # ---------- место на диске ----------
 

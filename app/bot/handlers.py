@@ -203,9 +203,14 @@ async def cmd_pause(msg: Message, command: CommandObject, pipeline: Pipeline, sc
 @router.message(Command("collect"))
 async def cmd_collect(msg: Message, pipeline: Pipeline) -> None:
     # Сбор может идти долго (качаются видео) — запускаем в фоне, черновики придут по мере готовности
-    for key in pipeline.profiles:
-        asyncio.create_task(pipeline.collect_job(key))
-    await msg.answer("Запустил сбор. Черновики будут приходить по мере обработки — /status покажет прогресс.")
+    active = [key for key in pipeline.profiles if not await pipeline.is_paused(key, "collect")]
+    if not active:
+        await msg.answer("Сбор на паузе у всех каналов. Возобновите его через /status.")
+        return
+    for key in active:
+        asyncio.create_task(pipeline.tick(key))
+    titles = ", ".join(html_escape(pipeline.profiles[key].title) for key in active)
+    await msg.answer(f"Запустил сбор и обработку: {titles}. Прогресс виден в /status.")
 
 
 @router.message(Command("publish"))
