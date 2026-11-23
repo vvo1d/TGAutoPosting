@@ -16,19 +16,14 @@ sources:
     # Русскоязычные новостные каналы
     - username: pokerflow_news          # Pokerflow FF — качественные новости
       min_age_hours: 2
-      min_views: 400
+      min_views: 300
 
     - username: pokerinsider_ru         # PokerInsider RU
       min_age_hours: 3
-      min_views: 80
+      min_views: 50
 
-  web:
-    # Основные англоязычные источники
-    - rss: https://www.cardplayer.com/poker-news.rss
-      max_entries: 10
-
-    - rss: https://www.pokernews.com/rss.php
-      max_entries: 12
+  # Веб-источники временно отключены — текущий парсер заточен под Recipe
+  # web: []
 
 style: |
   Ты пишешь новости для русскоязычного Telegram-канала о покере.
