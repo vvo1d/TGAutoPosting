@@ -185,86 +185,131 @@ class AnthropicBackend:
 
 
 class OpenAICompatBackend:
-    """SambaNova Cloud и любой другой OpenAI-совместимый API (base_url + ключ + модель)."""
+    """SambaNova Cloud и любой другой OpenAI-совместимый API (base_url + ключ + модель).
+    При ошибках 429/503/timeout пробует резервную модель, если она настроена.
+    """
 
     def __init__(self, settings: Settings):
         from openai import AsyncOpenAI
 
-        http_client = None
-        if not settings.llm_api_key:
-            # Анонимный доступ (например, OVHcloud AI Endpoints): шлём запрос без заголовка Authorization
-            log.warning("LLM_API_KEY не задан — работаю анонимно с %s", settings.llm_base_url)
-
-            async def _strip_auth(request: httpx.Request) -> None:
-                request.headers.pop("Authorization", None)
-
-            http_client = httpx.AsyncClient(event_hooks={"request": [_strip_auth]}, timeout=180)
-        self.client = AsyncOpenAI(api_key=settings.llm_api_key or "anonymous", base_url=settings.llm_base_url,
-                                  max_retries=2, http_client=http_client)
+        self.settings = settings
         self.model = settings.llm_model
         self.vision = settings.llm_vision
-        rpm = settings.llm_rpm or (2 if not settings.llm_api_key else 0)  # анонимный OVH: 2 запроса/мин
-        self._interval = 60 / rpm + 1 if rpm else 0
-        self._last_call = 0.0
-        self._lock = asyncio.Lock()
-        # Что принимает сервер, выясняем по ходу и запоминаем (400 -> пробуем вариант попроще)
         self._formats = ["json_schema", "json_object"]
         self._max_images = 4
 
+        # Основной клиент
+        self.client = self._make_client(settings.llm_base_url, settings.llm_api_key)
+
+        # Резервный клиент (если настроен)
+        self.fallback_client = None
+        self.fallback_model = None
+        if settings.llm_fallback_base_url and settings.llm_fallback_model:
+            self.fallback_client = self._make_client(
+                settings.llm_fallback_base_url,
+                settings.llm_fallback_api_key
+            )
+            self.fallback_model = settings.llm_fallback_model
+            log.info("LLM fallback: %s / %s", settings.llm_fallback_base_url, self.fallback_model)
+
+        rpm = settings.llm_rpm or (2 if not settings.llm_api_key else 0)
+        self._interval = 60 / rpm + 1 if rpm else 0
+        self._last_call = 0.0
+        self._lock = asyncio.Lock()
+
+    def _make_client(self, base_url: str, api_key: str | None):
+        from openai import AsyncOpenAI
+        import httpx
+
+        http_client = None
+        if not api_key:
+            async def _strip_auth(request: httpx.Request) -> None:
+                request.headers.pop("Authorization", None)
+            http_client = httpx.AsyncClient(event_hooks={"request": [_strip_auth]}, timeout=180)
+
+        return AsyncOpenAI(
+            api_key=api_key or "anonymous",
+            base_url=base_url,
+            max_retries=1,
+            http_client=http_client,
+            timeout=120,
+        )
+
     async def complete(self, system: str, prompt: str, images: list[str], model_cls: type[BaseModel]):
+        # Сначала пробуем основную модель
+        try:
+            return await self._complete_with(self.client, self.model, system, prompt, images, model_cls)
+        except Exception as e:
+            err = str(e).lower()
+            is_rate_limit = "429" in err or "rate limit" in err or "too many requests" in err
+            is_temp = is_rate_limit or "503" in err or "timeout" in err or "unavailable" in err
+
+            if not (is_temp and self.fallback_client and self.fallback_model):
+                raise
+
+            log.warning("Основная LLM недоступна (%s), переключаюсь на fallback: %s", e, self.fallback_model)
+            return await self._complete_with(
+                self.fallback_client, self.fallback_model, system, prompt, images, model_cls
+            )
+
+    async def _complete_with(self, client, model: str, system: str, prompt: str, images: list[str], model_cls: type[BaseModel]):
         from openai import BadRequestError
+        import json
 
         schema = model_cls.model_json_schema()
         sys_json = system + "\n\nОтветь строго одним JSON-объектом по схеме:\n" + json.dumps(schema, ensure_ascii=False)
 
-        def build(imgs: list[str]) -> list[dict]:
-            user: list[dict] | str = prompt
-            if imgs:
-                user = [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{i}"}} for i in imgs]
-                user.append({"type": "text", "text": prompt})
-            return [{"role": "system", "content": sys_json}, {"role": "user", "content": user}]
+        async with self._lock:
+            now = time.time()
+            wait = self._interval - (now - self._last_call)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_call = time.time()
 
-        def fmt(kind: str) -> dict:
-            if kind == "json_schema":
-                return {"type": "json_schema", "json_schema": {"name": "post", "schema": schema}}
-            return {"type": "json_object"}
+        content = [{"type": "text", "text": prompt}]
+        if images and self.vision:
+            for img in images[: self._max_images]:
+                content.insert(0, {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img}"}
+                })
 
-        resp = None
-        while resp is None:
-            async with self._lock:  # соблюдаем лимит запросов в минуту
-                wait = self._last_call + self._interval - time.monotonic()
-                if wait > 0:
-                    await asyncio.sleep(wait)
-                self._last_call = time.monotonic()
-            imgs = images[: self._max_images]
+        messages = [
+            {"role": "system", "content": sys_json},
+            {"role": "user", "content": content},
+        ]
+
+        last_err = None
+        for fmt in self._formats:
             try:
-                resp = await self.client.chat.completions.create(
-                    model=self.model, messages=build(imgs), max_tokens=8000, temperature=0.7,
-                    response_format=fmt(self._formats[0]),
-                )
-            except BadRequestError as e:
-                msg = (e.message or "")[:200]
-                if imgs and len(imgs) > 1:
-                    log.warning("Сервер не принял %d картинок (%s) — шлю по одной", len(imgs), msg)
-                    self._max_images = 1
-                elif len(self._formats) > 1:
-                    log.warning("%s не принят (%s) — пробую %s", self._formats[0], msg, self._formats[1])
-                    self._formats.pop(0)
-                elif imgs:
-                    log.warning("Сервер не принял картинку (%s) — работаю только с текстом", msg)
-                    self._max_images = 0
+                kwargs = {
+                    "model": model,
+                    "messages": messages,
+                    "temperature": 0.4,
+                }
+                if fmt == "json_schema":
+                    kwargs["response_format"] = {
+                        "type": "json_schema",
+                        "json_schema": {"name": model_cls.__name__, "schema": schema, "strict": False}
+                    }
                 else:
-                    raise
+                    kwargs["response_format"] = {"type": "json_object"}
 
-        choice = resp.choices[0]
-        raw = choice.message.content or ""
-        if choice.finish_reason == "length":
-            raise RuntimeError("Ответ модели обрезан по длине")
-        try:
-            return model_cls.model_validate_json(_extract_json(raw))
-        except ValueError as e:
-            raise RuntimeError(f"Модель вернула невалидный JSON: {e}; начало ответа: {raw[:200]!r}")
+                resp = await client.chat.completions.create(**kwargs)
+                text = resp.choices[0].message.content or ""
+                data = json.loads(text)
+                return model_cls.model_validate(data)
 
+            except BadRequestError as e:
+                last_err = e
+                if "json_schema" in str(e).lower() or "response_format" in str(e).lower():
+                    continue  # пробуем следующий формат
+                raise
+            except Exception as e:
+                last_err = e
+                raise
+
+        raise RuntimeError(f"Не удалось получить ответ от модели: {last_err}")
 
 def _extract_json(raw: str) -> str:
     """Убираем рассуждения <think>…</think> и обёртку ```json, если модель их добавила."""

@@ -43,6 +43,12 @@ class Settings(BaseSettings):
     llm_vision: bool = True           # слать модели фото и превью видео (нужна vision-модель)
     llm_rpm: int = 0                  # лимит запросов в минуту (0 — без ограничения; без ключа — 2)
 
+    # Резервная модель (включается при 429 / недоступности основной)
+    llm_fallback_base_url: str | None = None
+    llm_fallback_model: str | None = None
+    llm_fallback_api_key: str | None = None
+
+
     claude_model: str = "claude-opus-5-5"
     claude_effort: str = "medium"
     data_dir: Path = ROOT / "data"
