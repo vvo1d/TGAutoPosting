@@ -338,8 +338,7 @@ async def cmd_logs(msg: Message, command: CommandObject, pipeline: Pipeline) -> 
 async def cmd_server(msg: Message, pipeline: Pipeline) -> None:
     _, commit = await _run("git", "log", "-1", "--format=%h %ci %s")
     _, disk = await _run("df", "-h", str(ROOT_DIR))
-    media = sum(f.stat().st_size for f in pipeline.settings.media_dir.rglob("*") if f.is_file()) / 1e6 \
-        if pipeline.settings.media_dir.exists() else 0
+    media = await pipeline.media_usage() / 1e6
     await msg.answer(
         f"<b>Версия:</b> {html_escape(commit.strip())}\n"
         f"<b>systemd:</b> {'да' if UNDER_SYSTEMD else 'нет (запущено вручную)'}\n"
@@ -388,7 +387,7 @@ def _mb(b: int) -> str:
 
 async def _settings_menu(pipeline: Pipeline) -> tuple[str, object]:
     quota = await pipeline.setting("global", "media_mb") * 1_000_000
-    used = pipeline.media_usage()
+    used = await pipeline.media_usage()
     lines = ["<b>Настройки</b>", f"Медиа на диске: {_mb(used)} из {_mb(quota)}"]
     kb = InlineKeyboardBuilder()
     for key, p in pipeline.profiles.items():
@@ -452,7 +451,7 @@ def _plan_text(pl: dict) -> str:
 async def _global_page(pipeline: Pipeline, note: str = "") -> tuple[str, object]:
     from app.settings_rt import GLOBAL_PARAMS
 
-    used = pipeline.media_usage()
+    used = await pipeline.media_usage()
     lines = ["<b>🌐 Общие настройки</b>", f"Медиа на диске сейчас: {_mb(used)}", ""]
     kb = InlineKeyboardBuilder()
     sizes = []

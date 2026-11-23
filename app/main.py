@@ -41,11 +41,10 @@ async def main() -> None:
     db = DB(settings.db_path)
     await db.connect()
 
-    session = AiohttpSession(proxy=settings.tg_proxy) if settings.tg_proxy else None
     if settings.tg_proxy:
         log.info("Telegram через прокси %s", settings.tg_proxy)
-    bot = Bot(settings.bot_token, session=session,
-              default=DefaultBotProperties(parse_mode="HTML", link_preview_is_disabled=True))
+    defaults = DefaultBotProperties(parse_mode="HTML", link_preview_is_disabled=True)
+    bot = Bot(settings.bot_token, session=AiohttpSession(proxy=settings.tg_proxy), default=defaults)
     tg = None
     if any(p.sources.telegram for p in profiles.values()):
         tg = TelegramReader(settings)
@@ -105,11 +104,14 @@ async def main() -> None:
         BotCommand(command="restart", description="Перезапустить приложение"),
     ])
 
+    # Получение команд использует отдельный пул соединений от загрузок медиа конвейера.
+    polling_bot = Bot(settings.bot_token, session=AiohttpSession(proxy=settings.tg_proxy), default=defaults)
     watchdog_task = asyncio.create_task(watchdog.run())  # systemd перезапустит, если цикл событий зависнет
     try:
-        await dp.start_polling(bot)
+        await dp.start_polling(polling_bot, close_bot_session=False)
     finally:
         watchdog_task.cancel()
+        await polling_bot.session.close()
         scheduler.shutdown(wait=False)
         if tg:
             await tg.stop()

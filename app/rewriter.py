@@ -116,7 +116,7 @@ class Rewriter:
         prompt = f"Исходный материал:\n<source>\n{text.strip() or '(текста нет, только медиа)'}\n</source>"
         if note:
             prompt += f"\n\nДополнительное указание редактора: {note}"
-        images = _images_for_llm(media) if self.backend.vision else []
+        images = await asyncio.to_thread(_images_for_llm, media) if self.backend.vision else []
         post = await self.backend.complete(system, prompt, images, RecipePost)
         if post is None:
             return _refused_recipe()
@@ -172,7 +172,7 @@ class Rewriter:
         if self.backend is None:
             raise RuntimeError("Для канала находок нужна LLM (LLM_PROVIDER не может быть none)")
         system, prompt = deals.system_prompt(profile), deals.build_prompt(text, links, note)
-        images = _images_for_llm(media) if self.backend.vision else []
+        images = await asyncio.to_thread(_images_for_llm, media) if self.backend.vision else []
         post = await self.backend.complete(system, prompt, images, deals.DealPost)
         if post is None:
             return deals.DealPost(is_deal=False, reject_reason="модель отказалась", title="", emoji="", intro="",

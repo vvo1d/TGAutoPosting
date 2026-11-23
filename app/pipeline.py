@@ -206,7 +206,8 @@ class Pipeline:
             log.info("[%s] очередь необработанных полная (%d/%d) — сбор пропущен", p.key, backlog, max_new)
             return 0
         quota = await self.setting("global", "media_mb") * 1_000_000
-        if self.media_usage() >= quota:
+        usage = await self.media_usage()
+        if usage >= quota:
             log.warning("[%s] медиа на диске больше лимита (%.0f МБ) — сбор пропущен", p.key, quota / 1e6)
             await self._notify_once(p, "media_quota",
                                     f"⚠️ Медиа на диске достигли лимита {quota / 1e6:.0f} МБ — сбор остановлен, пока не освободится место. "
@@ -218,7 +219,7 @@ class Pipeline:
         log.info("[%s] не хватает %d постов (выход годных %.0f%%) — собираю до %d материалов",
                  p.key, plan["need"], plan["yield"] * 100, self._budget)
         self._video_mb = await self.setting(p.key, "video_mb")
-        self._quota_left = quota - self.media_usage()
+        self._quota_left = quota - usage
         added = 0
         # Обходим источники в случайном порядке, чтобы ни один не был всегда первым
         tg_sources = random.sample(p.sources.telegram, len(p.sources.telegram))
@@ -257,7 +258,7 @@ class Pipeline:
             if not c.post.media and not (p.content_type == "news" and c.post.text.strip()):
                 continue
             if item_id := await self.db.add_item(p.key, c.post):
-                await self.db.update(item_id, phash=dedup.media_hash(c.post.media))
+                await self.db.update(item_id, phash=await asyncio.to_thread(dedup.media_hash, c.post.media))
                 added += 1
                 self._spend(c.post.media)
         if new_last is not None:
@@ -280,7 +281,7 @@ class Pipeline:
                 continue
             post.media = await self.web.download_images(images, self._media_dir(p, post))
             if post.media and (item_id := await self.db.add_item(p.key, post)):
-                await self.db.update(item_id, phash=dedup.media_hash(post.media))
+                await self.db.update(item_id, phash=await asyncio.to_thread(dedup.media_hash, post.media))
                 added += 1
                 self._spend(post.media)
         return added
@@ -291,9 +292,19 @@ class Pipeline:
 
     # ---------- место на диске ----------
 
-    def media_usage(self) -> int:
-        root = self.settings.media_dir
-        return sum(f.stat().st_size for f in root.rglob("*") if f.is_file()) if root.exists() else 0
+    async def media_usage(self) -> int:
+        return await asyncio.to_thread(self._media_usage)
+
+    def _media_usage(self) -> int:
+        total = 0
+        for path in self.settings.media_dir.rglob("*"):
+            try:
+                if path.is_file():
+                    total += path.stat().st_size
+            except FileNotFoundError:
+                # Уборка или публикация может удалить файл во время обхода.
+                continue
+        return total
 
     async def expire_stale(self, p: ChannelProfile) -> int:
         """Необработанные дольше ttl_h — устарели: удаляем их медиа и помечаем отклонёнными."""
@@ -364,7 +375,7 @@ class Pipeline:
             return
         new_items = await self.db.by_status(p.key, "new", limit=1000)
         for it in new_items:  # досчитываем хэши картинок (для материалов, собранных до появления проверки)
-            if not it.get("phash") and (h := dedup.media_hash(it["media"])):
+            if it["media"] and not it.get("phash") and (h := await asyncio.to_thread(dedup.media_hash, it["media"])):
                 it["phash"] = h
                 await self.db.update(it["id"], phash=h)
         items = self._mix_sources(new_items)
@@ -384,6 +395,9 @@ class Pipeline:
                     else:
                         await self.db.update(item["id"], status="approved")
                         auto_added += 1
+                        if auto_added == 1 and self.uses_scheduled(p):
+                            # Длинная серия запросов к модели не задерживает первый готовый пост.
+                            asyncio.create_task(self.sync_job(p.key))
             except Exception as e:
                 # При ошибке доступа, лимита или сервера материал остаётся в очереди.
                 status = getattr(e, "status_code", None)
@@ -393,7 +407,7 @@ class Pipeline:
                                 p.key, status or type(e).__name__, str(e)[:200])
                     if configuration_error:
                         await self._notify(p, f"⚠️ Модель недоступна ({status}): {str(e)[:300]}")
-                    return
+                    break
                 log.exception("[%s] item %s: ошибка обработки", p.key, item["id"])
                 await self.db.update(item["id"], status="failed", note=str(e)[:500])
         if auto_added:
@@ -445,7 +459,7 @@ class Pipeline:
 
         # Дубль по картинке/видео — проверяем до модели, это бесплатно
         pool = await self.db.dedup_pool(p.key, item["id"], p.dedup_days)
-        phash = item.get("phash") or dedup.media_hash(item["media"])
+        phash = item.get("phash") or await asyncio.to_thread(dedup.media_hash, item["media"])
         if phash:
             await self.db.update(item["id"], phash=phash)
             twin = next((o for o in pool if o["phash"] and dedup.hamming(phash, o["phash"]) <= dedup.PHASH_MAX_DISTANCE), None)
@@ -560,7 +574,8 @@ class Pipeline:
                 report["error"].append(url)
                 continue
             if item_id := await self.db.add_item(p.key, post):
-                await self.db.update(item_id, phash=dedup.media_hash(post.media), title_key=f"deal:{link.key}")
+                phash = await asyncio.to_thread(dedup.media_hash, post.media)
+                await self.db.update(item_id, phash=phash, title_key=f"deal:{link.key}")
                 known.add(link.key)
                 report["added"].append(prod.name)
             else:
