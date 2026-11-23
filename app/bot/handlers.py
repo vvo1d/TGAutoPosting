@@ -6,9 +6,13 @@ import logging
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from time import monotonic
+from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import BaseFilter, Command, CommandObject
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -24,12 +28,6 @@ pending_edits: dict[int, int] = {}
 # user_id -> item_id, ждём от модератора ссылку(и) на товар
 pending_links: dict[int, int] = {}
 
-STATUS_RU = {
-    "new": "новые", "draft": "черновики", "pending": "на модерации", "approved": "в очереди",
-    "scheduled": "в отложенных", "published": "опубликовано", "rejected": "отклонено", "failed": "ошибки",
-}
-
-
 class IsAdmin(BaseFilter):
     async def __call__(self, event: Message | CallbackQuery, pipeline: Pipeline) -> bool:
         user = event.from_user
@@ -44,7 +42,7 @@ router.callback_query.filter(IsAdmin())
 async def cmd_help(msg: Message) -> None:
     await msg.answer(
         "Я веду ваши каналы.\n\n"
-        "/status — статистика и очередь\n"
+        "/status — статистика и очередь с автообновлением\n"
         "/collect — собрать и подготовить посты сейчас\n"
         "/publish &lt;канал&gt; — опубликовать следующий из очереди\n"
         "/settings — все настройки каналов: проверка, постов в день, лимиты сбора и места на диске\n"        "/max — публикация в каналы MAX вместе с Telegram\n"
@@ -59,46 +57,96 @@ async def cmd_help(msg: Message) -> None:
 WHAT_RU = {"collect": "Сбор", "post": "Постинг"}
 
 
-async def _status_text(pipeline: Pipeline, scheduler) -> str:
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
+STATUS_REFRESH_SECONDS = 5
 
-    lines = []
-    for key, p in pipeline.profiles.items():
+
+async def _status_card(pipeline: Pipeline, scheduler):
+    sections = ["📊 <b>Статус каналов</b>"]
+    keyboard = InlineKeyboardBuilder()
+    for key, profile in pipeline.profiles.items():
         counts = await pipeline.db.count(key)
-        stats = ", ".join(f"{STATUS_RU.get(s, s)}: {c}" for s, c in sorted(counts.items())) or "пусто"
-        if pipeline.uses_scheduled(p):
-            sch = await pipeline.db.by_status(key, "scheduled", limit=1000, order="scheduled_at")
-            tz = ZoneInfo(p.timezone)
-            info = f"В отложенных: {len(sch)}"
-            if sch:
-                info += (f", ближайший {datetime.fromisoformat(sch[0]['scheduled_at']).astimezone(tz):%d.%m %H:%M}"
-                         f", расписано до {datetime.fromisoformat(sch[-1]['scheduled_at']).astimezone(tz):%d.%m}")
+        controls = []
+        for action, label in WHAT_RU.items():
+            paused = await pipeline.is_paused(key, action)
+            controls.append(f"{'⏸' if paused else '▶️'} {label.lower()}")
+            keyboard.button(
+                text=f"{'▶️' if paused else '⏸'} {label} · {profile.title}",
+                callback_data=f"ctl:{key}:{action}:{'on' if paused else 'off'}",
+            )
+        lines = [
+            f"<b>{html_escape(profile.title)}</b> · <code>{html_escape(key)}</code>",
+            "  ·  ".join(controls),
+            f"📥 Новые <b>{counts.get('new', 0)}</b>  ·  📝 Проверка <b>{counts.get('pending', 0)}</b>"
+            f"  ·  ✅ Готово <b>{counts.get('approved', 0)}</b>",
+        ]
+        zone = ZoneInfo(profile.timezone)
+        if pipeline.uses_scheduled(profile):
+            scheduled = await pipeline.db.by_status(key, "scheduled", limit=1000, order="scheduled_at")
+            slots = [datetime.fromisoformat(item["scheduled_at"]).astimezone(zone)
+                     for item in scheduled if item["scheduled_at"]]
+            lines.append(f"🗓 В отложенных <b>{counts.get('scheduled', 0)}</b>")
+            if slots:
+                lines.append(f"Ближайший выпуск <b>{slots[0]:%d.%m %H:%M %Z}</b>"
+                             f"  ·  до {slots[-1]:%d.%m %H:%M}")
         else:
             job = scheduler.get_job(f"publish:{key}")
-            info = "Следующая публикация: " + (job.next_run_time.strftime("%d.%m %H:%M") if job and job.next_run_time else "—")
-        parts = []
-        for w in ("collect", "post"):
-            parts.append(f"{WHAT_RU[w]}: {'⏸ пауза' if await pipeline.is_paused(key, w) else '▶️ работает'}")
-        state = " · ".join(parts)
-        lines.append(f"<b>{html_escape(p.title)}</b> ({key})\n{state}\n{stats}\n{info}")
-    return "\n\n".join(lines)
+            next_run = job.next_run_time.astimezone(zone) if job and job.next_run_time else None
+            lines.append(f"🗓 Следующий выпуск <b>{next_run:%d.%m %H:%M %Z}</b>" if next_run
+                         else "🗓 Следующий выпуск —")
+        history = [f"Опубликовано {counts.get('published', 0)}", f"Отклонено {counts.get('rejected', 0)}"]
+        if counts.get("draft"):
+            history.append(f"Черновики {counts['draft']}")
+        if counts.get("failed"):
+            history.append(f"⚠️ Ошибки {counts['failed']}")
+        lines.append("  ·  ".join(history))
+        sections.append("\n".join(lines))
+    keyboard.adjust(2)
+    return "\n\n".join(sections), keyboard.as_markup()
 
 
-async def _status_kb(pipeline: Pipeline):
-    kb = InlineKeyboardBuilder()
-    for key, p in pipeline.profiles.items():
-        for w in ("collect", "post"):
-            paused = await pipeline.is_paused(key, w)
-            kb.button(text=f"{'▶️' if paused else '⏸'} {WHAT_RU[w]} · {p.title}",
-                      callback_data=f"ctl:{key}:{w}:{'on' if paused else 'off'}")
-    kb.adjust(2)
-    return kb.as_markup()
+async def _edit_status(message: Message, card) -> None:
+    text, markup = card
+    try:
+        await message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest as error:
+        if "message is not modified" not in str(error).lower():
+            raise
 
 
 @router.message(Command("status"))
 async def cmd_status(msg: Message, pipeline: Pipeline, scheduler) -> None:
-    await msg.answer(await _status_text(pipeline, scheduler), reply_markup=await _status_kb(pipeline))
+    last_card = await _status_card(pipeline, scheduler)
+    text, markup = last_card
+    message = await msg.answer(text, reply_markup=markup)
+    job_id = f"status:{message.chat.id}"
+    retry_at = 0.0
+
+    async def refresh() -> None:
+        nonlocal last_card, retry_at
+        if monotonic() < retry_at:
+            return
+        card = await _status_card(pipeline, scheduler)
+        if card == last_card:
+            return
+        try:
+            await _edit_status(message, card)
+        except TelegramRetryAfter as error:
+            retry_at = monotonic() + error.retry_after
+            return
+        except (TelegramBadRequest, TelegramForbiddenError) as error:
+            if isinstance(error, TelegramForbiddenError) or any(reason in str(error).lower() for reason in (
+                "message to edit not found", "message can't be edited", "chat not found",
+            )):
+                # A newer /status may already have replaced this job while the edit was in flight.
+                job = scheduler.get_job(job_id)
+                if job and job.func is refresh:
+                    job.remove()
+                return
+            raise
+        last_card = card
+
+    scheduler.add_job(refresh, "interval", id=job_id, name=str(message.message_id), seconds=STATUS_REFRESH_SECONDS,
+                      replace_existing=True, max_instances=1, coalesce=True)
 
 
 @router.callback_query(F.data.startswith("ctl:"))
@@ -112,7 +160,12 @@ async def on_control(cb: CallbackQuery, pipeline: Pipeline, scheduler) -> None:
     await cb.answer(f"{WHAT_RU[what]} · {p.title}: {'пауза' if mode == 'off' else 'возобновлён'}")
     if mode == "on" and what == "post" and pipeline.uses_scheduled(p):
         asyncio.create_task(pipeline.sync_job(key))  # сразу разложить накопившуюся очередь
-    await cb.message.edit_text(await _status_text(pipeline, scheduler), reply_markup=await _status_kb(pipeline))
+    if isinstance(cb.message, Message):
+        job = scheduler.get_job(f"status:{cb.message.chat.id}")
+        if job and job.name == str(cb.message.message_id):
+            job.modify(next_run_time=datetime.now(timezone.utc))
+        else:
+            await _edit_status(cb.message, await _status_card(pipeline, scheduler))
 
 
 def _parse_pause_args(args: str | None, pipeline: Pipeline) -> tuple[list[str], list[str]] | str:
@@ -143,7 +196,8 @@ async def cmd_pause(msg: Message, command: CommandObject, pipeline: Pipeline, sc
             await pipeline.set_paused(k, w, paused)
         if not paused and "post" in whats and pipeline.uses_scheduled(pipeline.profiles[k]):
             asyncio.create_task(pipeline.sync_job(k))
-    await msg.answer(await _status_text(pipeline, scheduler), reply_markup=await _status_kb(pipeline))
+    text, markup = await _status_card(pipeline, scheduler)
+    await msg.answer(text, reply_markup=markup)
 
 
 @router.message(Command("collect"))
