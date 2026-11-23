@@ -246,17 +246,20 @@ class OpenAICompatBackend:
         self._retry_at = {}
         self._json_object_only = set()
 
-        self.client = self._register_client(settings.llm_base_url, settings.llm_api_key, settings.llm_rpm)
+        self.client = self._register_client(
+            settings.llm_base_url, settings.llm_api_key, settings.llm_rpm, settings.llm_proxy
+        )
         self.fallback_client = None
         self.fallback_model = settings.llm_fallback_model
         if settings.llm_fallback_base_url and self.fallback_model:
             self.fallback_client = self._register_client(
-                settings.llm_fallback_base_url, settings.llm_fallback_api_key, settings.llm_fallback_rpm
+                settings.llm_fallback_base_url, settings.llm_fallback_api_key, settings.llm_fallback_rpm,
+                settings.llm_fallback_proxy,
             )
             log.info("Резервная LLM: %s", self.fallback_model)
 
-    def _register_client(self, base_url: str, api_key: str | None, rpm: int):
-        client = self._make_client(base_url, api_key)
+    def _register_client(self, base_url: str, api_key: str | None, rpm: int, proxy: str | None):
+        client = self._make_client(base_url, api_key, proxy)
         self._locks[client] = asyncio.Lock()
         rpm = rpm or (2 if not api_key else 0)
         self._intervals[client] = 60 / rpm + 1 if rpm else 0
@@ -292,15 +295,16 @@ class OpenAICompatBackend:
                 log.warning("LLM %s вернула 429. Пауза %.0f с", model, delay)
                 raise
 
-    def _make_client(self, base_url: str, api_key: str | None):
+    def _make_client(self, base_url: str, api_key: str | None, proxy: str | None):
         from openai import AsyncOpenAI
         import httpx
 
-        http_client = None
+        hooks = {}
         if not api_key:
             async def _strip_auth(request: httpx.Request) -> None:
                 request.headers.pop("Authorization", None)
-            http_client = httpx.AsyncClient(event_hooks={"request": [_strip_auth]}, timeout=180)
+            hooks["request"] = [_strip_auth]
+        http_client = httpx.AsyncClient(proxy=proxy or None, event_hooks=hooks) if proxy or hooks else None
 
         return AsyncOpenAI(
             api_key=api_key or "anonymous",

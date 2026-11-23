@@ -385,13 +385,13 @@ class Pipeline:
                         await self.db.update(item["id"], status="approved")
                         auto_added += 1
             except Exception as e:
-                # Лимит (429), сбой сервера (5xx), нет оплаты (402), модель снята (410), неверный ключ (401):
-                # материал не виноват — оставляем его в очереди и сообщаем модератору
+                # При ошибке доступа, лимита или сервера материал остаётся в очереди.
                 status = getattr(e, "status_code", None)
-                if isinstance(e, APIConnectionError) or status in (401, 402, 404, 410, 429) or (status and status >= 500):
+                configuration_error = status in (401, 402, 403, 404, 410)
+                if isinstance(e, APIConnectionError) or configuration_error or status == 429 or (status and status >= 500):
                     log.warning("[%s] LLM недоступна (%s), продолжу позже: %s",
                                 p.key, status or type(e).__name__, str(e)[:200])
-                    if status in (401, 402, 404, 410):
+                    if configuration_error:
                         await self._notify(p, f"⚠️ Модель недоступна ({status}): {str(e)[:300]}")
                     return
                 log.exception("[%s] item %s: ошибка обработки", p.key, item["id"])

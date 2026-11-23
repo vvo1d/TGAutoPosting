@@ -59,6 +59,7 @@ async def main() -> int:
             "llm_base_url": settings.llm_fallback_base_url,
             "llm_model": settings.llm_fallback_model,
             "llm_api_key": settings.llm_fallback_api_key,
+            "llm_proxy": settings.llm_fallback_proxy,
             "llm_rpm": settings.llm_fallback_rpm,
             "llm_vision": settings.llm_vision if settings.llm_fallback_vision is None else settings.llm_fallback_vision,
         })
