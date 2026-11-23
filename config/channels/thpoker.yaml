@@ -6,7 +6,10 @@ timezone: Europe/Moscow
 
 # Расписание публикаций
 schedule: ["10:00", "13:30", "17:00", "20:30"]
+content_type: news
 publish_mode: scheduled
+moderation: false
+buffer_days: 1
 collect_every_minutes: 40
 max_pending_drafts: 8
 dedup_days: 21

@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from telethon.errors import ScheduleTooMuchError
+from telethon.errors import AuthKeyDuplicatedError, ScheduleTooMuchError, UnauthorizedError
 
 from app import deals, dedup
 from app.links import LinkResolver, canonical, wb_articles
@@ -30,7 +30,7 @@ from app.publisher import send_post
 from app.rules import AD_MARKERS
 from app.scheduler_tg import ChannelScheduler
 from app.settings_rt import CHANNEL_PARAMS, GLOBAL_PARAMS, clamp
-from app.rewriter import CAPTION_LIMIT, RecipePost, Rewriter, format_caption, html_escape, visible_len
+from app.rewriter import CAPTION_LIMIT, RecipePost, Rewriter, format_caption, format_news, html_escape, visible_len
 from app.sources.telegram import TelegramReader
 from app.sources.market import MarketReader
 from app.sources.web import WebReader
@@ -240,7 +240,7 @@ class Pipeline:
     async def _collect_tg(self, p: ChannelProfile, src) -> int:
         source = f"tg:{src.key}"
         last_id = await self.db.get_last_id(p.key, source)
-        candidates, new_last = await self.tg.fetch(src, last_id)
+        candidates, new_last = await self.tg.fetch(src, last_id, allow_text=p.content_type == "news")
         added = 0
         for n, c in enumerate(candidates):
             if self._budget <= 0 or self._quota_left <= 0:
@@ -253,7 +253,7 @@ class Pipeline:
             if await self.db.is_known(p.key, c.post):
                 continue
             c.post.media = await self.tg.download(c, self._media_dir(p, c.post), self._video_mb)
-            if not c.post.media:
+            if not c.post.media and not (p.content_type == "news" and c.post.text.strip()):
                 continue
             if item_id := await self.db.add_item(p.key, c.post):
                 await self.db.update(item_id, phash=dedup.media_hash(c.post.media))
@@ -429,9 +429,10 @@ class Pipeline:
             "SELECT COUNT(*) FROM items WHERE channel=? AND status='scheduled' AND scheduled_at>?", (key, now))
         return (await cur.fetchone())[0]
 
-    @staticmethod
-    def media_ok(item: dict) -> bool:
-        return bool(item["media"]) and all(Path(m.path).exists() for m in item["media"])
+    def media_ok(self, item: dict) -> bool:
+        if not item["media"]:
+            return self.profiles[item["channel"]].content_type == "news"
+        return all(Path(m.path).exists() for m in item["media"])
 
     async def _rewrite_item(self, p: ChannelProfile, item: dict, note: str | None = None) -> bool:
         if not self.media_ok(item):
@@ -451,6 +452,17 @@ class Pipeline:
 
         if p.content_type == "deal":
             return await self._rewrite_deal(p, item, pool, note)
+
+        if p.content_type == "news":
+            res = await self.rewriter.rewrite_news(p, item["raw_text"], note)
+            if not res.is_news:
+                return await self._reject(item, res.reject_reason or "не новость")
+            title = dedup.title_key(res.title)
+            twin = next((o for o in pool if o["title_key"] == title), None)
+            if twin:
+                return await self._reject(item, f"дубликат новости: #{twin['id']}")
+            await self.db.update(item["id"], status="draft", title_key=title, caption=format_news(res))
+            return True
 
         res = await self.rewriter.rewrite(p, item["raw_text"], item["media"], note=note)
         if not res.is_recipe:
@@ -573,6 +585,11 @@ class Pipeline:
             if res.is_deal:
                 caption, warnings = deals.format_deal(res, links, p, self._own_links(item, links))
                 await self.db.update(item_id, caption=caption, note="\n".join(warnings) or None)
+            return await self.db.get(item_id)
+        if p.content_type == "news":
+            res = await self.rewriter.rewrite_news(p, item["raw_text"], note)
+            if res.is_news:
+                await self.db.update(item_id, caption=format_news(res), title_key=dedup.title_key(res.title))
             return await self.db.get(item_id)
         res = await self.rewriter.rewrite(p, item["raw_text"], item["media"], note=note)
         caption = format_caption(res) if res.is_recipe else item["caption"]
@@ -722,6 +739,9 @@ class Pipeline:
                 ids = await sch.schedule(p.target, it["media"], it["caption"] or "", slot)
             except ScheduleTooMuchError:
                 self._limit_reached(p, count)
+                break
+            except (AuthKeyDuplicatedError, UnauthorizedError) as e:
+                log.error("[%s] сессия Telegram недоступна, посты остаются в очереди: %s", p.key, e)
                 break
             except Exception as e:
                 log.exception("[%s] не удалось поставить #%s в отложенные", p.key, it["id"])

@@ -63,7 +63,7 @@ class TelegramReader:
         self._invite_cache[src.invite] = chat
         return chat
 
-    async def fetch(self, src: TelegramSource, last_id: int | None) -> tuple[list[TgCandidate], int | None]:
+    async def fetch(self, src: TelegramSource, last_id: int | None, *, allow_text: bool = False) -> tuple[list[TgCandidate], int | None]:
         entity = await self._resolve(src)
         if last_id is None:
             msgs = await self.client.get_messages(entity, limit=src.initial_limit)
@@ -96,12 +96,12 @@ class TelegramReader:
             first = items[0]
             if first.date < cutoff:
                 continue
-            if not any(_media_kind(m) for m in items):
-                continue  # формат канала требует фото или видео
+            text = next((m.message for m in items if m.message), "") or ""
+            if not any(_media_kind(m) for m in items) and not (allow_text and text.strip()):
+                continue
             views = max((m.views or 0) for m in items)
             if views < src.min_views:
                 continue
-            text = next((m.message for m in items if m.message), "") or ""
             url = (f"https://t.me/{src.username}/{first.id}" if src.username
                    else f"https://t.me/c/{entity.id}/{first.id}")
             post = RawPost(source=f"tg:{src.key}", source_ref=str(first.id), text=text, views=views, url=url)

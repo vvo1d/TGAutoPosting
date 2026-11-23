@@ -41,12 +41,13 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"
     llm_model: str = "Qwen3.8-27B"
     llm_vision: bool = True           # слать модели фото и превью видео (нужна vision-модель)
-    llm_rpm: int = 0                  # лимит запросов в минуту (0 — без ограничения; без ключа — 2)
+    llm_rpm: int = Field(default=0, ge=0)                  # лимит запросов в минуту (0 — без ограничения; без ключа — 2)
 
     # Резервная модель (включается при 429 / недоступности основной)
     llm_fallback_base_url: str | None = None
     llm_fallback_model: str | None = None
     llm_fallback_api_key: str | None = None
+    llm_fallback_rpm: int = Field(default=0, ge=0)
 
 
     claude_model: str = "claude-opus-5-5"
@@ -164,7 +165,7 @@ class Sources(BaseModel):
 class ChannelProfile(BaseModel):
     key: str
     title: str
-    content_type: str = "recipe"      # recipe — рецепты; deal — находки с маркетплейсов
+    content_type: str = "recipe"      # recipe — рецепты, deal — находки, news — новости
     target: str                       # @username канала или -100... id
     moderation_chat: int | None = None  # куда слать черновики; по умолчанию — первому из ADMIN_IDS
     timezone: str = "Europe/Moscow"

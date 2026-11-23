@@ -47,6 +47,10 @@ class ChannelScheduler:
         """Ставит пост в отложенные. Возвращает id отложенных сообщений."""
         entity = await self._entity(target)
         when = when.astimezone(timezone.utc)
+        if not media:
+            msg = await self.client.send_message(entity, caption, parse_mode="html",
+                                                 link_preview=False, schedule=when)
+            return [msg.id]
         media = media[:10]
         if len(media) == 1:
             m = media[0]

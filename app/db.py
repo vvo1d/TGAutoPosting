@@ -145,7 +145,7 @@ class DB:
         cur = await self.conn.execute(
             """SELECT id, status, phash, title_key, ingr_key FROM items
                WHERE channel=? AND id<>? AND created_at>=? AND (
-                     status IN ('draft','pending','approved','published')
+                     status IN ('draft','pending','approved','scheduled','published')
                   OR (status='rejected' AND (note IS NULL OR note NOT LIKE 'дубл%'))
                   OR (status='new' AND id<?))""",
             (channel, item_id, since, item_id),
